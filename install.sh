@@ -38,9 +38,28 @@ echo ""
 read -p "   Hermes webhook URL (e.g. http://192.168.1.10:8644/webhooks/sentinel): " MASTER_URL
 read -p "   Webhook shared secret: " SHARED_SECRET
 read -p "   Server name (for alerts, e.g. web-prod-1): " SERVER_NAME
-read -p "   Directories to scan [default: /var/www]: " WATCH_DIRS
+echo ""
+echo "   Directories to monitor:"
+echo "   Examples: /var/www/html, /home/user/public_html, /var/www/site1"
+echo "   Enter one per line. Empty line to finish."
+echo ""
+
+WATCH_DIRS_LIST=""
+while true; do
+    read -p "   Directory #$(( $(echo "$WATCH_DIRS_LIST" | grep -c '/' || echo 0) + 1 )): " dir
+    if [ -z "$dir" ]; then
+        break
+    fi
+    WATCH_DIRS_LIST="${WATCH_DIRS_LIST}  - ${dir}
+"
+done
+
+if [ -z "$WATCH_DIRS_LIST" ]; then
+    WATCH_DIRS_LIST="  - /var/www"
+    echo "   (defaulting to /var/www)"
+fi
+
 SERVER_NAME=${SERVER_NAME:-$(hostname)}
-WATCH_DIRS=${WATCH_DIRS:-/var/www}
 
 # Write config
 cat > /etc/hermes-sentinel/config.yaml << YAML
@@ -48,8 +67,7 @@ server_name: "${SERVER_NAME}"
 master_url: "${MASTER_URL}"
 secret: "${SHARED_SECRET}"
 watch_dirs:
-  - ${WATCH_DIRS}
-interval: 300
+${WATCH_DIRS_LIST}interval: 300
 baseline_on_start: true
 YAML
 
