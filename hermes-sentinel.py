@@ -106,18 +106,32 @@ def scan_cryptominers(dirs):
                         "detail": "Miner config file in web-accessible directory",
                         "severity": "high",
                     })
-    # Check process list
+    # Check process list — only flag if /proc/<pid>/cmdline is NON-empty
+    # (real kernel threads have empty cmdline; miners disguised via exec -a have real cmdlines)
     try:
         ps_out = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
         for line in ps_out.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            pid = parts[1]
+            proc_name = " ".join(parts[10:]) if len(parts) > 10 else ""
             for name in MINER_PROCESS_NAMES:
-                if name in line and "grep" not in line and "kernel" not in line.lower():
-                    findings.append({
-                        "type": "kernel_masquerade_process",
-                        "detail": f"Process masquerading as kernel daemon: {name}",
-                        "ps_line": line.strip(),
-                        "severity": "critical",
-                    })
+                if name in proc_name and "grep" not in line:
+                    # Verify: real kernel threads have empty /proc/<pid>/cmdline
+                    try:
+                        with open(f"/proc/{pid}/cmdline", "rb") as f:
+                            cmdline = f.read()
+                        if cmdline.strip(b"\x00").strip():
+                            # Non-empty cmdline → this is exec -a disguised process
+                            findings.append({
+                                "type": "kernel_masquerade_process",
+                                "detail": f"Process masquerading as kernel daemon: {name} (PID {pid})",
+                                "ps_line": line.strip(),
+                                "severity": "critical",
+                            })
+                    except (FileNotFoundError, PermissionError):
+                        pass  # Process already exited, skip
     except Exception:
         pass
     return findings
