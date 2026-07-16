@@ -1,0 +1,75 @@
+# PHP Backdoor & Remote Code Execution Patterns
+# From real-world forensic analysis (Jul 2026)
+
+patterns:
+  - name: "remote_code_execution_loader"
+    description: "C2 payload via base64 URL → multi-method fetch → eval chain"
+    severity: critical
+    search_terms:
+      - "megaranger.store"
+      - "base64_decode"
+      - "allow_url_include"
+      - "CURLOPT_RETURNTRANSFER"
+    combined_regex: 'base64_decode\s*\(\s*[\x27\x22][A-Za-z0-9+/=]{20,}[\x27\x22]\s*\).*eval\s*\(\s*[\x27\x22]\?>\s*[\x27\x22]'
+    sample_hash: "aHR0cHM6Ly9tZWdhcmFuZ2VyLnN0b3JlL2JhaGFuL3dyMjlrLnR4dA=="
+
+  - name: "password_protected_uploader"
+    description: "SHA256-gated file upload backdoor in hidden dot directories"
+    severity: critical
+    path_pattern: ".logs|.cache|.storage"
+    file_pattern: "index.php"
+    search_terms:
+      - "sha256"
+      - "move_uploaded_file"
+      - "file_put_contents"
+
+  - name: "gzuncompress_eval_chain"
+    description: "base64 → gzuncompress → eval — VATHAN VS EVERYBODY variant"
+    severity: critical
+    search_terms:
+      - "gzuncompress"
+      - "VATHAN VS EVERYBODY"
+      - "base64_decode"
+
+  - name: "known_attacker_c2_domains"
+    description: "Known C2 and payload domains from forensic analysis"
+    severity: critical
+    domains:
+      - "megaranger.store"
+      - "media420team.com"
+      - "google.drive03.com"
+
+  - name: "cgi_webshell_directory"
+    description: "ALFA/Eren/jancx family CGI webshell directories with .alfa handlers"
+    severity: critical
+    path_pattern: "ALFA_DATA|ERENUSE|jancox|osdcgiapi|alfacgiapi|Erencgiapi"
+    file_pattern: ".alfa|.Eren|.rimuru"
+
+  - name: "coded_by_sole_sad"
+    description: "Attacker signature in .htaccess enabling CGI execution"
+    severity: critical
+    search_terms:
+      - "Coded By Sole Sad"
+      - "AddHandler cgi-script .alfa"
+      - "Options FollowSymLinks MultiViews Indexes ExecCGI"
+
+  - name: "fake_copyright_header_backdoor"
+    description: "Obfuscated webshell camouflaged as legitimate library with fake @package header"
+    severity: high
+    search_terms:
+      - "Horde_Date"
+      - "Text_Diff"
+      - "@package_version@"
+    size_trigger_mb: 1
+    must_also_contain:
+      - "error_reporting(0)"
+      - "eval"
+
+  - name: "phtml_article_upload_backdoor"
+    description: "Backdoor uploaded via article submission exploiting parseFileExtension bypass"
+    severity: critical
+    file_pattern: ".phtml|.phar"
+    search_terms:
+      - "parseFileExtension"
+      - "stristr"
+    path_context: "articles"

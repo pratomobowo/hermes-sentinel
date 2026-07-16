@@ -83,13 +83,20 @@ When a satellite detects:
 
 | Threat | Pattern | Example |
 |--------|---------|---------|
-| Gambling injection | `<script src="http://slot*">` | situstogel, slot88, poker |
-| PHP backdoors | `eval(base64_decode()` | Common malware entry |
-| Shell execution | `shell_exec(`, `system(` | Command injection |
-| Cron anomalies | `www-data` cron with foreign URLs | Judol cron spam |
-| Uploaded shells | `.php` files in `/uploads/` | Backdoor uploads |
-| .htaccess redirects | `RewriteRule` to external domains | SEO spam redirect |
-| Core file tampering | Hash mismatch vs baseline | Modified WordPress/Laravel core |
+| **Remote Code Execution** | `eval(base64_decode(C2_URL))` chain | `megaranger.store` payload fetch |
+| **Massive Obfuscated Webshell** | 5.8MB PHP with fake `@package` header | `logicsecure.php`, `brainpanel.php` |
+| **CGI Webshell Directories** | ALFA/Eren/jancx family + `.alfa` handlers | Perl/Bash/Python reverse shells |
+| **PHP Backdoors** | `shell_exec()`, `eval()`, `gzuncompress()`, `passthru()` | Command injection gateways |
+| **Crypto Miners** | XMRig disguised as `[kswapd0]`, `[kcached]` | Cron re-launch every hour |
+| **SEO Cloaking** | `is_google_bot()` → gambling spam / real site | Gambling links indexed by Google |
+| **.phtml Upload Bypass** | Extension filter bypass via `.phtml`, `.phar` | Article submission backdoor |
+| **Password-Gated Uploaders** | SHA256 hash gate in `.logs/`, `.cache/`, `.storage/` | Hidden file upload backdoors |
+| **Identical Clone Spread** | Same file hash across 4+ directories | Attacker persistence cloning |
+| **Gambling Injection** | `<script src="http://slot*">` | situstogel, slot88, poker |
+| **Index.php Cloaking** | GoogleBot detection → spam include / real redirect | SEO poisoning |
+| **Cron Anomalies** | `www-data` cron with foreign URLs or miner launch | Judol cron spam |
+| **.htaccess Redirects** | `RewriteRule` to external domains | SEO spam redirect |
+| **Core File Tampering** | Hash mismatch vs baseline | Modified WordPress/Laravel core |
 
 ---
 

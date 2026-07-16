@@ -1,0 +1,56 @@
+# Server Vulnerability & Misconfiguration Detection
+# From forensic analysis — flags the conditions that allow initial compromise
+
+patterns:
+  - name: "mysql_exposed_to_internet"
+    description: "MySQL port 3306 binding to 0.0.0.0 — allows direct DB attacks"
+    severity: critical
+    check: "grep -q 'bind-address\\s*=\\s*0\\.0\\.0\\.0' /etc/my.cnf /etc/mysql/my.cnf /etc/mysql/mysql.conf.d/mysqld.cnf 2>/dev/null"
+    fix: "bind-address = 127.0.0.1"
+
+  - name: "allow_url_fopen_enabled"
+    description: "PHP allow_url_fopen = On — enables file_get_contents('https://...') to fetch remote payloads"
+    severity: critical
+    check: "grep -r 'allow_url_fopen\\s*=\\s*On' /www/server/php/*/etc/php.ini /etc/php/*/php.ini 2>/dev/null"
+    fix: "allow_url_fopen = Off"
+
+  - name: "curl_exec_not_disabled"
+    description: "curl_exec not in PHP disable_functions — enables remote payload download fallback"
+    severity: critical
+    check: "grep -v 'curl_exec' /www/server/php/*/etc/php.ini /etc/php/*/php.ini 2>/dev/null | grep -q 'disable_functions'"
+    fix: "Add curl_exec, exec, shell_exec, passthru, system, popen to disable_functions"
+
+  - name: "root_ssh_allowed"
+    description: "PermitRootLogin yes — allows direct root brute force"
+    severity: high
+    check: "grep -q '^PermitRootLogin\\s\\+yes' /etc/ssh/sshd_config 2>/dev/null"
+    fix: "PermitRootLogin no"
+
+  - name: "password_ssh_enabled"
+    description: "PasswordAuthentication yes — vulnerable to brute force"
+    severity: high
+    check: "grep -q '^PasswordAuthentication\\s\\+yes' /etc/ssh/sshd_config 2>/dev/null"
+    fix: "PasswordAuthentication no (use SSH keys only)"
+
+  - name: "writable_plugin_directories"
+    description: "Plugin directories writable by web server user — allows webshell upload"
+    severity: high
+    check: "find /www/wwwroot -path '*/plugins' -perm -o+w -exec ls -ld {} \\; 2>/dev/null"
+
+  - name: "no_htaccess_blocking"
+    description: "Web directories missing .htaccess to block PHP execution"
+    severity: medium
+    check: "find /www/wwwroot -type d \\( -path '*/uploads' -o -path '*/plugins' -o -path '*/files' \\) ! -exec test -f {}/.htaccess \\; -print 2>/dev/null"
+
+  - name: "phtml_phar_bypassable"
+    description: "parseFileExtension() only blocks .php — .phtml/.phar uploads bypass"
+    severity: high
+    search_terms:
+      - "parseFileExtension"
+      - "stristr.*php"
+    file_pattern: "FileManager.inc.php"
+
+  - name: "exposed_control_panel"
+    description: "BT-Panel (BaoTa) exposed — common attack vector if outdated"
+    severity: medium
+    port_check: [887, 888, 50000]

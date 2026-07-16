@@ -1,0 +1,51 @@
+# Cryptominer Detection Patterns
+# From forensic analysis: XMRig miner disguised as kernel processes (Jul 2026)
+
+patterns:
+  - name: "monero_xmrig_binary"
+    description: "XMRig cryptominer binary with .dat config file"
+    severity: critical
+    file_names:
+      - "defunct"
+      - "gs-dbus"
+      - "MINER_defunct_xmrig"
+    config_files:
+      - "*.dat"
+    search_terms:
+      - "xmrig"
+      - "defunct\\.dat"
+      - "gs-dbus\\.dat"
+
+  - name: "kernel_process_masquerade"
+    description: "Miner disguising as kernel daemon via exec -a [kswapd0] or [kcached]"
+    regex: 'exec\s+-a\s+[\x27\x22]\[(kswapd|kcached|kworker|kthreadd)[^\]]*\][\x27\x22]'
+    severity: critical
+
+  - name: "cron_cryptominer_persistence"
+    description: "Cron job that re-launches miner binary every hour"
+    severity: critical
+    cron_patterns:
+      - '\*\s+\*\s+\*\s+\*\s+\*.*(defunct|gs-dbus|xmrig)'
+      - '@hourly.*(defunct|gs-dbus|xmrig)'
+      - '0\s+\*\s+\*\s+\*\s+\*.*exec\s+-a\s+'
+    users_to_check:
+      - "www"
+      - "www-data"
+      - "nginx"
+      - "apache"
+
+  - name: "pkill_miner_guard"
+    description: "Guard clause that checks if miner is already running before re-launching"
+    regex: 'pkill\s+-0\s+-U\d+\s+(defunct|gs-dbus|xmrig)'
+    severity: high
+
+  - name: "miner_binary_in_webroot"
+    description: "ELF binary hidden in web-accessible CSS/template/js directories"
+    path_pattern: "template/.*/(defunct|gs-dbus)$|css/.*/(defunct|gs-dbus)$|js/.*/(defunct|gs-dbus)$"
+    severity: critical
+    file_type: "ELF binary"
+
+  - name: "miner_config_in_webroot"
+    description: "XMRig .dat config file in web-accessible directory"
+    path_pattern: "template/.*/.*\\.dat$|css/.*/.*\\.dat$|js/.*/.*\\.dat$"
+    severity: high

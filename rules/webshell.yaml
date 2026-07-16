@@ -1,0 +1,110 @@
+# Webshell Detection Patterns
+# From real forensic analysis of multi-wave attacks on OJS + SLiMS (Jul 2026)
+
+patterns:
+  - name: "massive_obfuscated_webshell"
+    description: "5.8MB obfuscated webshell camouflaged as vendor library — logicsecure/brainpanel/neuralcore family"
+    severity: critical
+    triggers:
+      - size_mb_gt: 1
+      - extension: ".php"
+      - must_contain: ["error_reporting(0)", "set_time_limit(0)", "eval"]
+      - likely_in_dirs: ["vendor", "lib", "plugins", "css", "js", "locale", "images"]
+    naming_pattern:
+      - ".*panel\\.php$"
+      - ".*vault\\.php$"
+      - ".*gate\\.php$"
+      - ".*core\\.php$"
+      - ".*system\\.php$"
+      - ".*pulse\\.php$"
+      - ".*root\\.php$"
+      - ".*access\\.php$"
+
+  - name: "php_in_wrong_directory"
+    description: ".php file in JS/CSS/Images/Locale directory — strong indicator of webshell"
+    severity: high
+    path_indicators:
+      - "/js/.*\\.php$"
+      - "/css/.*\\.php$"
+      - "/images/.*\\.php$"
+      - "/locale/.*\\.php$"
+      - "/news/.*\\.php$"
+
+  - name: "file_manager_webshell"
+    description: "Full-featured file manager webshell — gzuncompress + base64 chain"
+    severity: critical
+    search_terms:
+      - "make.file"
+      - "VATHAN VS EVERYBODY"
+      - "cosmospanel"
+      - "astrobackend"
+    size_kb_min: 30
+    must_also_contain:
+      - "eval"
+      - "gzuncompress"
+
+  - name: "aes_encrypted_webshell"
+    description: "Webshell encrypted with AES-256-CBC to evade signature detection"
+    severity: critical
+    search_terms:
+      - "AES-256-CBC"
+      - "openssl_decrypt"
+      - "MCRYPT_RIJNDAEL_256"
+
+  - name: "generic_tech_name_disguise"
+    description: "Malware using legitimate-sounding tech names as camouflage in wrong locations"
+    severity: medium
+    naming_pattern:
+      - "settings-ajax-sessions\\.php$"
+      - "settings-autoload\\.php$"
+      - "autofield\\.php$"
+      - "javascript-bundler\\.php$"
+      - "rate-limiter\\.php$"
+      - "session-handler\\.php$"
+      - "session-info\\.php$"
+      - "system-info\\.php$"
+      - "template-cache\\.php$"
+      - "key-value-store\\.php$"
+      - "wp-config\\.php$"
+      - "cron-job\\.php$"
+      - "mailer\\.php$"
+      - "smtp-test\\.php$"
+      - "extra-file\\.php$"
+      - "note\\.php$"
+      - "controllers\\.php$"
+      - "config\\.php$"
+      - "image-upload\\.php$"
+      - "sample-page\\.php$"
+      - "notification-sender\\.php$"
+      - "webhook-listener\\.php$"
+      - "task-runner\\.php$"
+      - "db-connect\\.php$"
+      - "sql-query\\.php$"
+      - "debug-mode\\.php$"
+      - "debug-console\\.php$"
+      - "email-validator\\.php$"
+      - "logger-config\\.php$"
+      - "file-manager\\.php$"
+      - "payment-gateway\\.php$"
+      - "api-endpoint\\.php$"
+      - "draft-note\\.php$"
+      - "archive-note\\.php$"
+      - "manual-page\\.php$"
+      - "auth-system\\.php$"
+      - "login-check\\.php$"
+      - "config-setting\\.php$"
+      - "backup-data\\.php$"
+      - "cache-data\\.php$"
+      - "data-info\\.php$"
+      - "temp-data\\.php$"
+      - "unlocked\\.php$"
+    must_also_be_suspicious:
+      - "size > 10KB"
+      - "in vendor/lib/plugins dir"
+      - "contains eval or base64_decode"
+
+  - name: "reinfection_persistence_pattern"
+    description: "Identical malware cloned across 4-5 directories — attacker maintaining persistence"
+    severity: critical
+    hash_match_across_dirs: true
+    min_clones: 3

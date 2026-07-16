@@ -52,7 +52,224 @@ PHP_BACKDOOR_PATTERNS = [
     (r'\$_POST\s*\[[\'"]\w+[\'"]\]\s*\(\s*\$_POST', "Backdoor: callback via POST"),
 ]
 
-# Suspicious cron patterns
+# ─── New: Rule Pack Loader ─────────────────────────────────────
+
+RULE_PACKS = {}
+def _load_rule_packs(rule_dir=None):
+    """Load YAML rule packs from rules/ directory."""
+    if rule_dir is None:
+        rule_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules")
+
+    packs = {}
+    if not os.path.isdir(rule_dir):
+        return packs
+
+    for fname in sorted(os.listdir(rule_dir)):
+        if not fname.endswith((".yaml", ".yml")):
+            continue
+        try:
+            with open(os.path.join(rule_dir, fname)) as f:
+                import yaml
+                data = yaml.safe_load(f)
+                if data and "patterns" in data:
+                    packs[fname] = data["patterns"]
+        except Exception:
+            pass
+    return packs
+
+# ─── New: Cryptominer Detection ────────────────────────────────
+
+MINER_FILENAMES = {"defunct", "gs-dbus", "xmrig", "MINER_defunct_xmrig"}
+MINER_PROCESS_NAMES = ["[kswapd0]", "[kcached]", "[kworker]", "[kthreadd]"]
+
+def scan_cryptominers(dirs):
+    """Scan for crypto miner binaries, configs, and cron persistence."""
+    findings = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for f in files:
+                if f in MINER_FILENAMES or any(f.startswith(p) for p in ["defunct", "gs-dbus", "xmrig"]):
+                    fp = os.path.join(root, f)
+                    findings.append({
+                        "type": "cryptominer_binary",
+                        "file": fp,
+                        "detail": f"Cryptominer binary detected: {f}",
+                        "severity": "critical",
+                    })
+                if f.endswith(".dat") and any(n in root for n in ["template", "css", "js", "plugins"]):
+                    fp = os.path.join(root, f)
+                    findings.append({
+                        "type": "miner_config_in_webroot",
+                        "file": fp,
+                        "detail": "Miner config file in web-accessible directory",
+                        "severity": "high",
+                    })
+    # Check process list
+    try:
+        ps_out = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
+        for line in ps_out.stdout.splitlines():
+            for name in MINER_PROCESS_NAMES:
+                if name in line and "grep" not in line and "kernel" not in line.lower():
+                    findings.append({
+                        "type": "kernel_masquerade_process",
+                        "detail": f"Process masquerading as kernel daemon: {name}",
+                        "ps_line": line.strip(),
+                        "severity": "critical",
+                    })
+    except Exception:
+        pass
+    return findings
+
+# ─── New: SEO Spam & Cloaking Detection ────────────────────────
+
+def scan_seo_spam(dirs):
+    """Detect gambling SEO spam, cloaked index.php, and spam HTML files."""
+    findings = []
+    SPAM_HTML_GLOBS = ["*-REP.html", "*-MAR.html"]
+    CLOAKING_TERMS = ["is_google_bot", "googlebot", "index_old.php", "strpos.*googlebot"]
+
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for f in files:
+                fp = os.path.join(root, f)
+
+                # home.php with gambling keywords
+                if f == "home.php":
+                    try:
+                        sz = os.path.getsize(fp)
+                        if sz > 100000:  # >100KB
+                            findings.append({
+                                "type": "seo_spam_homepage",
+                                "file": fp,
+                                "detail": f"Large home.php ({sz} bytes) — likely SEO spam landing page",
+                                "severity": "high",
+                            })
+                    except OSError:
+                        pass
+
+                # Cloaked index.php
+                if f == "index.php":
+                    try:
+                        with open(fp, "r", errors="replace") as fh:
+                            content = fh.read()
+                        if "is_google_bot" in content or "googlebot" in content.lower():
+                            findings.append({
+                                "type": "cloaked_index_php",
+                                "file": fp,
+                                "detail": "index.php contains GoogleBot cloaking logic",
+                                "severity": "critical",
+                            })
+                    except Exception:
+                        pass
+
+                # REP/MAR spam HTML
+                import fnmatch
+                for pat in SPAM_HTML_GLOBS:
+                    if fnmatch.fnmatch(f, pat):
+                        findings.append({
+                            "type": "seo_spam_html",
+                            "file": fp,
+                            "detail": "Auto-generated SEO spam HTML file",
+                            "severity": "medium",
+                        })
+
+    return findings
+
+# ─── New: PHTML/PHAR Backdoor Detection ────────────────────────
+
+SHELL_EXTENSIONS = {".phtml", ".phar", ".pht", ".php5", ".php7", ".shtml"}
+
+def scan_shell_extensions(dirs):
+    """Detect .phtml/.phar files that bypass file upload filters."""
+    findings = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in SHELL_EXTENSIONS:
+                    fp = os.path.join(root, f)
+                    findings.append({
+                        "type": "bypass_extension_backdoor",
+                        "file": fp,
+                        "detail": f"{ext} file bypasses PHP-extension-only upload filter",
+                        "severity": "critical",
+                    })
+    return findings
+
+# ─── New: CGI Webshell Directory Detection ─────────────────────
+
+CGI_WEBSHELL_DIRS = ["ALFA_DATA", "ERENUSE", "jancox", "osdcgiapi", "alfacgiapi", "Erencgiapi", "RIMURU"]
+CGI_WEBSHELL_EXTS = {".alfa", ".Eren", ".rimuru"}
+
+def scan_cgi_webshell_dirs(dirs):
+    """Detect CGI webshell directories and .alfa handlers."""
+    findings = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, dirs_list, files in os.walk(d):
+            for dirname in dirs_list:
+                if dirname in CGI_WEBSHELL_DIRS:
+                    findings.append({
+                        "type": "cgi_webshell_directory",
+                        "file": os.path.join(root, dirname),
+                        "detail": f"CGI webshell directory: {dirname} (ALFA/Eren/jancx family)",
+                        "severity": "critical",
+                    })
+            for f in files:
+                ext = os.path.splitext(f)[1]
+                if ext in CGI_WEBSHELL_EXTS:
+                    fp = os.path.join(root, f)
+                    findings.append({
+                        "type": "cgi_webshell_handler",
+                        "file": fp,
+                        "detail": f"CGI webshell handler: {ext}",
+                        "severity": "critical",
+                    })
+    return findings
+
+# ─── New: Clone Detection ──────────────────────────────────────
+
+def scan_cloned_malware(dirs):
+    """Detect identical malware files cloned across multiple directories."""
+    findings = []
+    hash_map = {}
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for f in files:
+                if not f.endswith(".php"):
+                    continue
+                fp = os.path.join(root, f)
+                try:
+                    sz = os.path.getsize(fp)
+                    if sz < 1000 or sz > 10000000:
+                        continue
+                except OSError:
+                    continue
+                h = hash_file(fp)
+                if h:
+                    hash_map.setdefault(h, []).append(fp)
+
+    for h, paths in hash_map.items():
+        if len(paths) >= 3:
+            findings.append({
+                "type": "cloned_malware",
+                "detail": f"Identical file found in {len(paths)} locations — persistence cloning",
+                "files": paths[:5],
+                "severity": "critical",
+            })
+    return findings
+
+# ─── Original: Suspicious cron patterns ────────────────────────
+
 SUSPICIOUS_CRON_PATTERNS = [
     (r"(wget|curl)\s+.*(\.xyz|\.top|\.tk|\.ml|\.ga|\.cf)", "Cron: foreign-TLD download"),
     (r"@(reboot|daily|hourly).*wget", "Cron: suspicious download on schedule"),
@@ -299,6 +516,11 @@ def main():
         findings = scan_files(watch_dirs, baseline)
         findings.extend(scan_crontabs())
         findings.extend(scan_recent_files(watch_dirs, minutes=60))
+        findings.extend(scan_cryptominers(watch_dirs))
+        findings.extend(scan_seo_spam(watch_dirs))
+        findings.extend(scan_shell_extensions(watch_dirs))
+        findings.extend(scan_cgi_webshell_dirs(watch_dirs))
+        findings.extend(scan_cloned_malware(watch_dirs))
 
         if args.json:
             print(json.dumps(findings, indent=2, ensure_ascii=False))
@@ -320,6 +542,11 @@ def main():
             findings = scan_files(watch_dirs, baseline)
             findings.extend(scan_crontabs())
             findings.extend(scan_recent_files(watch_dirs, minutes=interval // 60))
+            findings.extend(scan_cryptominers(watch_dirs))
+            findings.extend(scan_seo_spam(watch_dirs))
+            findings.extend(scan_shell_extensions(watch_dirs))
+            findings.extend(scan_cgi_webshell_dirs(watch_dirs))
+            findings.extend(scan_cloned_malware(watch_dirs))
 
             if findings:
                 print(f"[sentinel] {len(findings)} findings detected")

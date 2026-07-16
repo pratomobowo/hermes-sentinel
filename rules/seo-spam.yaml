@@ -1,0 +1,55 @@
+# SEO Spam & Cloaking Patterns
+# From forensic analysis: gambling SEO injection with Google cloaking (Jul 2026)
+
+patterns:
+  - name: "gambling_seo_spam_file"
+    description: "Dedicated spam file with hundreds of gambling keywords"
+    severity: high
+    file_names:
+      - "home.php"
+    size_kb_min: 100
+    search_terms:
+      - "GARUDA4D"
+      - "wso138"
+      - "casaprize"
+      - "pphoki"
+      - "maxim4d"
+      - "rezekitoto"
+      - "slot"
+      - "togel"
+      - "poker"
+
+  - name: "index_php_cloaking"
+    description: "Cloaked index.php that shows spam to GoogleBot and real site to users"
+    severity: critical
+    search_terms:
+      - "is_google_bot"
+      - "googlebot"
+      - "index_old\\.php"
+      - "strpos.*googlebot"
+    file_name: "index.php"
+    must_also_contain:
+      - "include"
+
+  - name: "seo_html_spam_files"
+    description: "Auto-generated spam HTML files disguised as academic/SEO content"
+    severity: medium
+    naming_pattern:
+      - ".*-REP\\.html$"
+      - ".*-MAR\\.html$"
+
+  - name: "gambling_blog_path"
+    description: "Fake academic blog paths that actually serve gambling content"
+    severity: high
+    url_patterns:
+      - "evaluasi-dampak.*mahjong"
+      - "popularitas.*slot.*kasino"
+      - "analisis.*togel"
+
+  - name: "hidden_iframe_spam"
+    description: "Hidden iframe pointing to external spam/malware domains"
+    search_terms:
+      - "lazada\\.co\\.id"
+      - "lazada\\.sg"
+    file_type: ".html"
+    additional_context: "appears in webroot or uploads, not in legitimate template files"
