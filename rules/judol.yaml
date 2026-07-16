@@ -1,0 +1,39 @@
+# Judol (Online Gambling) Injection Patterns
+# Extend this file to add more patterns as you discover them.
+
+patterns:
+  - name: "script_injection_gambling"
+    regex: |
+      <script\s+src=["']https?://(?:www\.)?([^"']*(?:slot|togel|poker|casino|judi|bola|maxwin|zeus|gacor|bocoran|hoki|jackpot|dewa|raja|mahjong|starlight|sweet-bonanza)[^"']*)["']
+    severity: critical
+    description: "HTML script tag injecting external gambling domain"
+
+  - name: "iframe_injection_gambling"
+    regex: |
+      <iframe\s+src=["']https?://(?:www\.)?([^"']*(?:slot|togel|poker|casino|judi)[^"']*)["']
+    severity: critical
+    description: "Hidden iframe pointing to gambling site"
+
+  - name: "meta_refresh_gambling"
+    regex: |
+      <meta\s+http-equiv=["']refresh["']\s+content=["']\d+;\s*url=https?://(?:www\.)?([^"']*(?:slot|togel|judi)[^"']*)["']
+    severity: high
+    description: "Meta refresh redirect to gambling site"
+
+  - name: "php_redirect_header"
+    regex: |
+      header\s*\(\s*["']Location:\s*https?://[^"']*(?:slot|togel|judi|poker|casino)[^"']*["']\s*\)
+    severity: critical
+    description: "PHP header redirect to gambling domain"
+
+  - name: "javascript_window_location"
+    regex: |
+      window\.location\s*=\s*["']https?://[^"']*(?:slot|togel|judi)[^"']*["']
+    severity: high
+    description: "JavaScript window.location redirect to gambling site"
+
+  - name: "php_socket_backdoor"
+    regex: |
+      fsockopen\s*\(\s*["'][^"']*(?:slot|togel|judi)[^"']*["']
+    severity: critical
+    description: "PHP fsockopen to gambling domain (C2 backdoor)"

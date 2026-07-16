@@ -1,0 +1,15 @@
+[Unit]
+Description=Hermes Sentinel — Malware detection agent
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /opt/hermes-sentinel/hermes-sentinel.py --config /etc/hermes-sentinel/config.yaml
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
