@@ -708,6 +708,12 @@ def baseline_db_init():
             added_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS sentinel_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     db.commit()
     db.close()
 
@@ -1149,7 +1155,7 @@ def scan_processes():
 
             # Check process signatures
             for pat, desc in PROCESS_SIGNATURES:
-                if re.search(pat, cmdline, re.IGNORECASE):
+                if re.search(pat, cmdline, re.IGNORECASE) and not _is_duplicate_alert("proc:" + pid + ":" + desc[:20], window_minutes=30):
                     findings.append({
                         "type": "suspicious_process",
                         "detail": desc,
@@ -1241,7 +1247,7 @@ def scan_network_connections():
             continue
 
         # Botnet/IRC ports
-        if rp in BOTNET_PORTS:
+        if rp in BOTNET_PORTS and not _is_duplicate_alert("net:botnet:" + rip + ":" + str(rp), window_minutes=30):
             findings.append({
                 "type": "suspicious_network_connection",
                 "detail": f"Outbound connection to botnet/IRC port {rp} -> {rip}",
@@ -1253,7 +1259,7 @@ def scan_network_connections():
             })
 
         # High outbound ports (potential reverse shell callbacks)
-        if rp > 50000 and rp not in (80, 443, 8080, 8443):
+        if rp > 50000 and rp not in (80, 443, 8080, 8443) and not _is_duplicate_alert("net:highport:" + rip + ":" + str(rp), window_minutes=30):
             findings.append({
                 "type": "high_port_outbound",
                 "detail": f"Outbound connection to high port {rp} -> {rip}",
@@ -1341,7 +1347,7 @@ def scan_user_sessions():
             tty = parts[1]
 
             # Root SSH login (not from console)
-            if username == "root" and tty != "tty1" and tty != "console":
+            if username == "root" and tty != "tty1" and tty != "console" and not _is_duplicate_alert("root_remote_login", window_minutes=30):
                 findings.append({
                     "type": "root_remote_login",
                     "detail": f"Root login via {tty} — use sudo instead",
@@ -1374,7 +1380,7 @@ def scan_user_sessions():
     try:
         result = subprocess.run(["lastb", "-n", "20"], capture_output=True, text=True, timeout=5)
         fail_count = sum(1 for l in result.stdout.splitlines() if l.strip() and "ssh:" in l.lower())
-        if fail_count >= 10:
+        if fail_count >= 10 and not _is_duplicate_alert("ssh_brute_force", window_minutes=30):
             findings.append({
                 "type": "ssh_brute_force",
                 "detail": f"{fail_count} recent SSH login failures — possible brute force attack",
@@ -1410,20 +1416,20 @@ def scan_systemd_timers():
     if known_timers:
         new_timers = current_timers - known_timers
         for t in new_timers:
-            # Read timer file for details
-            timer_detail = ""
-            try:
-                with open(t) as f:
-                    timer_detail = f.read()[:256]
-            except Exception:
-                pass
-            findings.append({
-                "type": "new_systemd_timer",
-                "detail": f"New systemd timer: {os.path.basename(t)}",
-                "timer_path": t,
-                "timer_content": timer_detail[:256],
-                "severity": "medium",
-            })
+            if not _is_duplicate_alert("timer:" + t, window_minutes=60):
+                timer_detail = ""
+                try:
+                    with open(t) as f:
+                        timer_detail = f.read()[:256]
+                except Exception:
+                    pass
+                findings.append({
+                    "type": "new_systemd_timer",
+                    "detail": f"New systemd timer: {os.path.basename(t)}",
+                    "timer_path": t,
+                    "timer_content": timer_detail[:256],
+                    "severity": "medium",
+                })
 
     _set_state("known_timers", json.dumps(sorted(current_timers)))
     return findings
