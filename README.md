@@ -173,7 +173,15 @@ watch_dirs:                                                    # Directories to 
 interval: 300                                                  # Seconds between scans
 baseline_on_start: true                                        # Build SHA256 baseline
 quarantine: false                                              # Auto-isolate CRITICAL+HIGH threats
+integrity_excludes:                                            # Optional: skip integrity check for volatile dirs
+  - /var/www/app/cache/
+  - "*.log"
+  - "*.lock"
 ```
+
+**Built-in integrity excludes** (always active): `cache/`, `tmp/`, `logs/`, `sessions/`, `compiled/`, `*.log`, `*.cache`, `*.lock`, `*.pid`, `*.tmp`
+
+These suppress `file_modified`, `new_file`, and `file_deleted` alerts for volatile files — but **malware content scanning still runs**. A backdoor in `/var/www/cache/evil.php` will still be detected as CRITICAL, just without the accompanying "file changed" noise.
 
 **Persistent baseline** is stored at `/etc/hermes-sentinel/baseline.db` (SQLite). Survives restarts and reboots — no rebuild needed unless `baseline_on_start: true`.
 
