@@ -480,6 +480,164 @@ def scan_cloned_malware(dirs):
             })
     return findings
 
+
+# ─── v0.9.0: Image-Embedded PHP — bypass upload filter ──────────
+
+IMAGE_MAGIC_BYTES = {
+    b"\xff\xd8\xff": "JPEG",
+    b"\x89PNG\r\n\x1a\n": "PNG",
+    b"GIF89a": "GIF89a",
+    b"GIF87a": "GIF87a",
+}
+
+
+def scan_image_embedded_php(dirs):
+    """Detect PHP code embedded in image files (upload filter bypass)."""
+    findings = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    sz = os.path.getsize(fp)
+                    if sz < 64 or sz > 10 * 1024 * 1024:
+                        continue
+                    with open(fp, "rb") as fh:
+                        header = fh.read(12)
+                except (OSError, PermissionError):
+                    continue
+
+                is_image = any(header.startswith(m) for m in IMAGE_MAGIC_BYTES)
+                if not is_image:
+                    continue
+
+                try:
+                    with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                        content = fh.read()
+                except (OSError, PermissionError):
+                    continue
+
+                if "<?php" in content or "<?=" in content:
+                    ext = os.path.splitext(f)[1].lower()
+                    findings.append({
+                        "type": "image_embedded_php",
+                        "file": fp,
+                        "detail": f"PHP code in image file ({ext}) — upload filter bypass",
+                        "severity": "critical",
+                    })
+    return findings
+
+
+# ─── v0.9.0: Symlink Attack — file read jailbreak ──────────────
+
+SYMLINK_SENSITIVE_TARGETS = [
+    "wp-config.php", "config.php", ".env", ".htaccess",
+    "passwd", "shadow", "id_rsa", "id_ed25519",
+    "/dev", "authorized_keys",
+]
+
+
+def scan_symlink_attack(dirs):
+    """Detect symlinks pointing to sensitive files from web-accessible dirs."""
+    findings = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    if not os.path.islink(fp):
+                        continue
+                    target = os.readlink(fp)
+                except OSError:
+                    continue
+                target_lower = target.lower()
+                if any(s in target_lower for s in SYMLINK_SENSITIVE_TARGETS):
+                    findings.append({
+                        "type": "symlink_attack",
+                        "file": fp,
+                        "detail": f"Symlink to sensitive file: {fp} → {target}",
+                        "severity": "critical",
+                    })
+    return findings
+
+
+# ─── v0.9.0: .user.ini Backdoor — PHP auto_prepend injection ───
+
+def scan_user_ini_injection(dirs):
+    """Detect .user.ini files with auto_prepend_file/auto_append_file backdoor."""
+    findings = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for f in files:
+                if f.lower() != ".user.ini":
+                    continue
+                fp = os.path.join(root, f)
+                if os.path.islink(fp):
+                    continue
+                try:
+                    with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                        content = fh.read()
+                except (OSError, PermissionError):
+                    continue
+                if "auto_prepend_file" in content or "auto_append_file" in content:
+                    findings.append({
+                        "type": "user_ini_backdoor",
+                        "file": fp,
+                        "detail": ".user.ini auto_prepend/auto_append backdoor in web root",
+                        "severity": "critical",
+                    })
+    return findings
+
+
+# ─── v0.9.0: Polyglot Webshell — valid file that runs as PHP ───
+
+POLYGLOT_EXTENSIONS = {".svg", ".xml", ".ico", ".wav", ".pdf"}
+
+
+def scan_polyglot_webshell(dirs):
+    """Detect files with non-PHP extensions containing executable PHP."""
+    findings = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for f in files:
+                fp = os.path.join(root, f)
+                ext = os.path.splitext(f)[1].lower()
+                if ext not in POLYGLOT_EXTENSIONS:
+                    continue
+                try:
+                    sz = os.path.getsize(fp)
+                    if sz < 64 or sz > 2 * 1024 * 1024:
+                        continue
+                    with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                        content = fh.read()
+                except (OSError, PermissionError):
+                    continue
+
+                php_patterns = [
+                    r"<\?php\s",
+                    r"<\?=\s",
+                    r"\beval\s*\(.*\$_(GET|POST|REQUEST)",
+                    r"\bsystem\s*\(\s*\$",
+                    r"\bshell_exec\s*\(\s*\$",
+                ]
+                if any(re.search(p, content, re.IGNORECASE) for p in php_patterns):
+                    findings.append({
+                        "type": "polyglot_webshell",
+                        "file": fp,
+                        "detail": f"Polyglot webshell: {ext} file contains executable PHP code",
+                        "severity": "critical",
+                    })
+    return findings
+
+
 # ─── Original: Suspicious cron patterns ────────────────────────
 
 SUSPICIOUS_CRON_PATTERNS = [
@@ -562,7 +720,6 @@ def _diff_detail(fp, old_hash=None):
 
 def _alert_dedup_db():
     """Ensure dedup table exists in baseline db."""
-    import contextlib
     try:
         db = sqlite3.connect(_get_baseline_db())
         db.execute("""
@@ -1957,6 +2114,10 @@ def daemon_loop_inotify(watch_dirs, baseline, config, rule_packs, interval):
 
             # Full-walk scans only on full scan (every 15 min)
             if full_scan:
+                findings.extend(scan_image_embedded_php(watch_dirs))
+                findings.extend(scan_symlink_attack(watch_dirs))
+                findings.extend(scan_user_ini_injection(watch_dirs))
+                findings.extend(scan_polyglot_webshell(watch_dirs))
                 findings.extend(scan_cryptominers(watch_dirs))
                 findings.extend(scan_seo_spam(watch_dirs))
                 findings.extend(scan_shell_extensions(watch_dirs))
@@ -2054,6 +2215,10 @@ def main():
         findings, scanned_paths = scan_files(watch_dirs, baseline, config, git_changed)
         findings.extend(scan_crontabs())
         findings.extend(scan_recent_files(watch_dirs, minutes=60))
+        findings.extend(scan_image_embedded_php(watch_dirs))
+        findings.extend(scan_symlink_attack(watch_dirs))
+        findings.extend(scan_user_ini_injection(watch_dirs))
+        findings.extend(scan_polyglot_webshell(watch_dirs))
         findings.extend(scan_cryptominers(watch_dirs))
         findings.extend(scan_seo_spam(watch_dirs))
         findings.extend(scan_shell_extensions(watch_dirs))

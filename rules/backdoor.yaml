@@ -73,3 +73,36 @@ patterns:
       - "parseFileExtension"
       - "stristr"
     path_context: "articles"
+
+  - name: "ld_preload_disable_functions_bypass"
+    description: "putenv + LD_PRELOAD + mail() — bypass PHP disable_functions"
+    severity: critical
+    search_terms:
+      - "LD_PRELOAD"
+    must_also_contain:
+      - "putenv"
+      - "mail"
+
+  - name: "chmod_777_sensitive_files"
+    description: "World-writable permission escalation on sensitive config files"
+    severity: high
+    search_terms:
+      - "chmod"
+    combined_regex: 'chmod\s+["\x27]?\s*0?777["\x27]?\s+.*(config|wp-config|.htaccess|.env|id_rsa)'
+
+  - name: "wp_config_exfiltration"
+    description: "Small script dedicated to reading and exfiltrating wp-config.php"
+    severity: critical
+    search_terms:
+      - "wp-config.php"
+    must_also_contain:
+      - "file_get_contents"
+    combined_regex: 'wp-config\.php.*(curl_init|mail\s*\(|file_get_contents|fopen|smtp|telegram)'
+
+  - name: "c2_socket_connection"
+    description: "Direct socket connection to C2 server (fsockopen/stream_socket_client)"
+    severity: critical
+    search_terms:
+      - "fsockopen"
+      - "stream_socket_client"
+    combined_regex: '(fsockopen|stream_socket_client)\s*\([^)]*[,\s]*"\d{2,5}"\s*\)'
