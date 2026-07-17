@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermes Sentinel — Lightweight web server malware detection agent.
+"""Hermes Sentinel v0.4.0 — Lightweight web server malware detection agent.
 
 Watches your web server for malware, gambling redirects, and backdoors.
 Reports findings to a central Hermes Agent for AI-powered reasoning.
@@ -526,6 +526,142 @@ def is_volatile_path(filepath, config=None):
     return False
 
 
+# ─── v0.4.0: Diff Output ───────────────────────────────────────
+
+def _count_lines(fp):
+    try:
+        with open(fp, 'rb') as f:
+            return sum(1 for _ in f)
+    except Exception:
+        return 0
+
+
+def _file_size(fp):
+    try:
+        return os.path.getsize(fp)
+    except OSError:
+        return 0
+
+
+def _diff_detail(fp, old_hash=None):
+    lines = _count_lines(fp)
+    sz = _file_size(fp)
+    return f'{lines} lines, {sz} bytes'
+
+
+# ─── v0.4.0: Alert Dedup ────────────────────────────────────────
+
+_ALERT_DEDUP = {}
+
+
+def _is_duplicate_alert(fp, window_minutes=10):
+    now = time.time()
+    if fp in _ALERT_DEDUP:
+        if now - _ALERT_DEDUP[fp] < window_minutes * 60:
+            return True
+    _ALERT_DEDUP[fp] = now
+    return False
+
+
+# ─── v0.4.0: Severity Tuning ────────────────────────────────────
+
+def integrity_severity(fp):
+    high_risk = ['/images/', '/uploads/', '/assets/', '/media/',
+                 '/js/', '/css/', '/fonts/', '/static/']
+    for d in high_risk:
+        if d in fp:
+            return 'high'
+    low_risk = ['/vendor/', '/node_modules/', '/bower_components/',
+                '/cache/', '/tmp/', '/logs/']
+    for d in low_risk:
+        if d in fp:
+            return 'low'
+    return 'medium'
+
+
+# ─── v0.4.0: Git-Aware Integrity ─────────────────────────────────
+
+def _set_state(key, value):
+    db_path = _get_baseline_db()
+    try:
+        db = sqlite3.connect(db_path)
+        db.execute('CREATE TABLE IF NOT EXISTS sentinel_state (key TEXT PRIMARY KEY, value TEXT)')
+        db.execute('INSERT OR REPLACE INTO sentinel_state (key, value) VALUES (?, ?)', (key, value))
+        db.commit()
+        db.close()
+    except Exception:
+        pass
+
+
+def _get_state(key):
+    db_path = _get_baseline_db()
+    try:
+        db = sqlite3.connect(db_path)
+        row = db.execute('SELECT value FROM sentinel_state WHERE key = ?', (key,)).fetchone()
+        db.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def git_tracked_changes(watch_dir):
+    git_dir = os.path.join(watch_dir, '.git')
+    if not os.path.isdir(git_dir):
+        return set()
+    try:
+        result = subprocess.run(
+            ['git', '-C', watch_dir, 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return set()
+        current_head = result.stdout.strip()
+    except Exception:
+        return set()
+    state_key = f'git_head:{watch_dir}'
+    stored_head = _get_state(state_key)
+    if not stored_head:
+        _set_state(state_key, current_head)
+        return set()
+    if stored_head == current_head:
+        return set()
+    try:
+        result = subprocess.run(
+            ['git', '-C', watch_dir, 'diff', '--name-only', stored_head, current_head],
+            capture_output=True, text=True, timeout=10
+        )
+        changed = set()
+        for f in result.stdout.strip().split(chr(10)):
+            if not f:
+                continue
+            full = os.path.normpath(os.path.join(watch_dir, f))
+            changed.add(full)
+    except Exception:
+        changed = set()
+    _set_state(state_key, current_head)
+    return changed
+
+
+# ─── v0.4.0: Unified Integrity Skip ─────────────────────────────
+
+def is_integrity_skipped(fp, config=None, git_changed=None):
+    import fnmatch
+    if is_volatile_path(fp, config):
+        return True
+    if config:
+        fname = os.path.basename(fp)
+        for pat in config.get('integrity_whitelist', []):
+            if '*' in pat or '?' in pat:
+                if fnmatch.fnmatch(fname, pat) or fnmatch.fnmatch(fp, pat):
+                    return True
+            else:
+                if pat in fp or pat == fname:
+                    return True
+    if git_changed and fp in git_changed:
+        return True
+    return False
+
+
 def hash_file(path):
     """Return SHA256 of a file."""
     h = hashlib.sha256()
@@ -774,9 +910,10 @@ def build_baseline(dirs):
     return baseline
 
 
-def scan_files(dirs, baseline=None, config=None):
+def scan_files(dirs, baseline=None, config=None, git_changed=None):
     """Scan watched directories for threats. Returns list of findings.
-    config is needed for integrity exclude checking."""
+    config is needed for integrity exclude checking.
+    git_changed is set of files changed by git (skip integrity alerts)."""
     findings = []
     scanned_paths = set()
 
@@ -806,34 +943,31 @@ def scan_files(dirs, baseline=None, config=None):
 
                 scanned_paths.add(fp)
 
-                # Check baseline: new file (exists on disk, not in baseline)
-                # Skip integrity check for volatile paths (cache, logs, sessions, etc.)
-                if baseline and fp not in baseline and not is_volatile_path(fp, config):
-                    current_hash = hash_file(fp)
-                    if current_hash:
-                        findings.append({
-                            "type": "new_file",
-                            "file": fp,
-                            "detail": "New file detected — not in baseline snapshot",
-                            "severity": "medium",
-                        })
-                        # Auto-add to baseline so it only alerts once
-                        baseline_db_update(fp, current_hash)
-                        baseline[fp] = current_hash
+                # Check baseline: new file
+                if baseline and fp not in baseline and not is_integrity_skipped(fp, config, git_changed):
+                    if not _is_duplicate_alert(fp):
+                        current_hash = hash_file(fp)
+                        if current_hash:
+                            findings.append({
+                                "type": "new_file",
+                                "file": fp,
+                                "detail": f"New file — {_diff_detail(fp)}",
+                                "severity": integrity_severity(fp),
+                            })
+                            baseline_db_update(fp, current_hash)
+                            baseline[fp] = current_hash
 
                 # Check baseline: file modified
-                # Skip integrity alert for volatile paths, but silently re-baseline
                 if baseline and fp in baseline:
                     current_hash = hash_file(fp)
                     if current_hash and current_hash != baseline[fp]:
-                        if not is_volatile_path(fp, config):
+                        if not is_integrity_skipped(fp, config, git_changed) and not _is_duplicate_alert(fp):
                             findings.append({
                                 "type": "file_modified",
                                 "file": fp,
-                                "detail": "File hash changed from baseline",
-                                "severity": "medium",
+                                "detail": f"Hash changed — {_diff_detail(fp)}",
+                                "severity": integrity_severity(fp),
                             })
-                        # Re-baseline so same change doesn't alert again
                         baseline_db_update(fp, current_hash)
                         baseline[fp] = current_hash
 
@@ -882,9 +1016,9 @@ def scan_files(dirs, baseline=None, config=None):
 
 # ─── Scan: detect files deleted from baseline ────────────────────
 
-def scan_deleted_files(scanned_paths, config=None):
+def scan_deleted_files(scanned_paths, config=None, git_changed=None):
     """Detect files in baseline that no longer exist on disk.
-    Skips volatile paths to avoid noise."""
+    Skips volatile, whitelisted, and git-changed paths."""
     findings = []
     db_path = _get_baseline_db()
     if not os.path.exists(db_path):
@@ -895,7 +1029,7 @@ def scan_deleted_files(scanned_paths, config=None):
         db.close()
         for (fp,) in rows:
             if fp not in scanned_paths and not os.path.exists(fp):
-                if not is_volatile_path(fp, config):
+                if not is_integrity_skipped(fp, config):
                     findings.append({
                         "type": "file_deleted",
                         "file": fp,
@@ -1044,7 +1178,14 @@ def main():
 
     # Single scan mode (for cron usage)
     if args.scan_once or args.json:
-        findings, scanned_paths = scan_files(watch_dirs, baseline, config)
+        # Pre-compute git-changed files for integrity skip
+        git_changed = set()
+        for d in watch_dirs:
+            git_changed |= git_tracked_changes(d)
+        if git_changed:
+            print(f'[sentinel] Git changes detected in {len(git_changed)} files — skipping integrity alerts')
+
+        findings, scanned_paths = scan_files(watch_dirs, baseline, config, git_changed)
         findings.extend(scan_crontabs())
         findings.extend(scan_recent_files(watch_dirs, minutes=60))
         findings.extend(scan_cryptominers(watch_dirs))
@@ -1054,7 +1195,7 @@ def main():
         findings.extend(scan_cloned_malware(watch_dirs))
         if rule_packs:
             findings.extend(scan_rule_packs(watch_dirs, rule_packs))
-        findings.extend(scan_deleted_files(scanned_paths, config))
+        findings.extend(scan_deleted_files(scanned_paths, config, git_changed))
 
         # Quarantine CRITICAL/HIGH findings
         quarantine_count = 0
@@ -1084,7 +1225,12 @@ def main():
     while True:
         try:
             print(f"[sentinel] Scanning... ({time.strftime('%H:%M:%S')})")
-            findings, scanned_paths = scan_files(watch_dirs, baseline, config)
+            # Pre-compute git-changed files for integrity skip
+            git_changed = set()
+            for d in watch_dirs:
+                git_changed |= git_tracked_changes(d)
+
+            findings, scanned_paths = scan_files(watch_dirs, baseline, config, git_changed)
             findings.extend(scan_crontabs())
             findings.extend(scan_recent_files(watch_dirs, minutes=interval // 60))
             findings.extend(scan_cryptominers(watch_dirs))
@@ -1094,7 +1240,7 @@ def main():
             findings.extend(scan_cloned_malware(watch_dirs))
             if rule_packs:
                 findings.extend(scan_rule_packs(watch_dirs, rule_packs))
-            findings.extend(scan_deleted_files(scanned_paths, config))
+            findings.extend(scan_deleted_files(scanned_paths, config, git_changed))
 
             if findings:
                 # Quarantine CRITICAL/HIGH before reporting
@@ -1151,19 +1297,24 @@ def _load_config(path):
                 key = key.strip()
                 val = val.strip().strip('"').strip("'")
 
-                if key == "watch_dirs":
+                if not val:
+                    # Empty value after colon — could be a list
                     current_key = key
                     config[key] = []
                 elif val == "true":
                     config[key] = True
+                    current_key = None
                 elif val == "false":
                     config[key] = False
+                    current_key = None
                 elif val.isdigit():
                     config[key] = int(val)
+                    current_key = None
                 else:
                     config[key] = val
-            elif line.startswith("- ") and current_key == "watch_dirs":
-                config["watch_dirs"].append(line[2:].strip())
+                    current_key = None
+            elif line.startswith("- ") and current_key and isinstance(config.get(current_key), list):
+                config[current_key].append(line[2:].strip())
 
     return config
 

@@ -121,15 +121,26 @@ You should get a Telegram alert from Hermes analyzing the test report.
 | 17 | REP/MAR auto-generated spam HTML | `seo-spam.yaml` | Medium |
 | 18 | .phtml/.phar upload filter bypass | Agent core | Critical |
 
-### File Integrity Monitoring
+### File Integrity Monitoring (v0.4.0 — Smart Integrity)
 
 Persistent SHA256 baseline via SQLite. Survives daemon restarts and reboots.
 
 | Detection | Severity | Description |
 |-----------|----------|-------------|
-| `file_modified` | Medium | Hash changed from baseline |
-| `new_file` | Medium | New file appeared (not in baseline) |
+| `file_modified` | Path-based ↓ | Hash changed from baseline |
+| `new_file` | Path-based ↓ | New file appeared (not in baseline) |
 | `file_deleted` | Low | Baseline file disappeared from disk |
+
+**Smart severity:** `/images/` / `/uploads/` → HIGH, `/vendor/` / `/node_modules/` → LOW, everything else → MEDIUM. Each integrity alert includes a diff summary (line count + size).
+
+**v0.4.0 Noise Reduction:**
+
+| Feature | Description |
+|---------|-------------|
+| **Git-aware** | Tracks git HEAD via SQLite. Files changed by `git pull`/checkout skip integrity alerts — only alert on uncommitted changes |
+| **Whitelist** | `integrity_whitelist` patterns in config (glob or path). `public/app.js`, `vendor/*`, etc. |
+| **Alert dedup** | Same file = 1 alert in 10 minutes. Modified 3x → 1 alert, not 3 |
+| **Diff output** | `file_modified` now shows: `"Hash changed — 142 lines, 4821 bytes"` |
 
 ### Optional: Auto-Quarantine
 
@@ -173,10 +184,15 @@ watch_dirs:                                                    # Directories to 
 interval: 300                                                  # Seconds between scans
 baseline_on_start: true                                        # Build SHA256 baseline
 quarantine: false                                              # Auto-isolate CRITICAL+HIGH threats
-integrity_excludes:                                            # Optional: skip integrity check for volatile dirs
+integrity_excludes:                                            # Skip integrity check for volatile dirs
   - /var/www/app/cache/
   - "*.log"
   - "*.lock"
+integrity_whitelist:                                           # v0.4.0: skip integrity for known-safe files
+  - composer.lock
+  - package-lock.json
+  - "public/app.js"
+  - "vendor/*"
 ```
 
 **Built-in integrity excludes** (always active): `cache/`, `tmp/`, `logs/`, `sessions/`, `compiled/`, `*.log`, `*.cache`, `*.lock`, `*.pid`, `*.tmp`
