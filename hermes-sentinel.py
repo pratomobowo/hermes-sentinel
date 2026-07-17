@@ -1157,6 +1157,30 @@ def should_quarantine(finding, config):
     return True
 
 
+# ─── Integrity-Based Vendor Content Skip ───────────────────────
+
+PACKAGE_DIR_MARKERS = [os.sep + n + os.sep for n in ("vendor", "node_modules")]
+
+
+def _should_skip_content_scan(fp, baseline):
+    """Skip content scan for vendor/node_modules files whose hash is
+    unchanged from baseline (legitimate library code). File must be:
+    1. Inside a vendor/ or node_modules/ directory
+    2. Present in the baseline hash database
+    3. Current hash matches baseline hash
+
+    Files with changed hash or new vendor files still get full content scan.
+    """
+    if not baseline or fp not in baseline:
+        return False
+    if not any(m in fp for m in PACKAGE_DIR_MARKERS):
+        return False
+    current = hash_file(fp)
+    if current and current == baseline[fp]:
+        return True
+    return False
+
+
 def _scan_file_patterns(fp, content, findings):
     """Run built-in malware patterns against file content. Mutates findings list."""
     for domain in JUDOL_DOMAINS:
@@ -1270,6 +1294,9 @@ def scan_files(dirs, baseline=None, config=None, git_changed=None):
                         baseline[fp] = current_hash
 
                 # Read and scan file content
+                if _should_skip_content_scan(fp, baseline):
+                    continue
+
                 try:
                     with open(fp, "r", encoding="utf-8", errors="replace") as fh:
                         content = fh.read()
@@ -1970,6 +1997,8 @@ def scan_files_incremental(file_list, baseline=None, config=None, git_changed=No
                 baseline[fp] = current_hash
 
         # Content scan
+        if _should_skip_content_scan(fp, baseline):
+            continue
         try:
             if is_large:
                 # Scan only head + tail
