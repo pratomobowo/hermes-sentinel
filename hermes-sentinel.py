@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import time
+import sqlite3
 import urllib.request
 import argparse
 from pathlib import Path
@@ -496,9 +497,141 @@ def hash_file(path):
         return None
 
 
-def build_baseline(dirs):
-    """Build initial hash baseline for all scannable files."""
+# ─── SQLite Persistent Baseline ─────────────────────────────────
+
+def _baseline_db_path(config=None):
+    """Return path to the SQLite baseline database. Uses config dir if provided."""
+    if config and config.get("_config_dir"):
+        return os.path.join(config["_config_dir"], "baseline.db")
+    # Fallback: next to the script
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "baseline.db")
+
+
+# Module-level: set by main() from config path
+_BASELINE_DB_FILE = None
+
+
+def _get_baseline_db():
+    """Return the current baseline db path."""
+    global _BASELINE_DB_FILE
+    if _BASELINE_DB_FILE:
+        return _BASELINE_DB_FILE
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "baseline.db")
+
+
+def baseline_db_init():
+    """Create baseline table if not exists."""
+    db = sqlite3.connect(_get_baseline_db())
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS baseline (
+            filepath TEXT PRIMARY KEY,
+            sha256 TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime REAL NOT NULL,
+            added_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def baseline_db_load():
+    """Load all baseline entries into a dict {filepath: sha256}."""
     baseline = {}
+    db_path = _get_baseline_db()
+    if not os.path.exists(db_path):
+        return baseline
+    try:
+        db = sqlite3.connect(db_path)
+        rows = db.execute("SELECT filepath, sha256 FROM baseline").fetchall()
+        for fp, sha in rows:
+            baseline[fp] = sha
+        db.close()
+    except Exception:
+        pass
+    return baseline
+
+
+def baseline_db_save(baseline_dict):
+    """Persist current file hashes to SQLite (UPSERT)."""
+    db = sqlite3.connect(_get_baseline_db())
+    baseline_db_init()
+    now = time.time()
+    for fp, sha in baseline_dict.items():
+        try:
+            st = os.stat(fp)
+            sz = st.st_size
+            mt = st.st_mtime
+        except OSError:
+            sz = 0
+            mt = now
+        db.execute(
+            """INSERT OR REPLACE INTO baseline (filepath, sha256, size, mtime, added_at)
+               VALUES (?, ?, ?, ?, datetime('now'))""",
+            (fp, sha, sz, mt)
+        )
+    db.commit()
+    db.close()
+
+
+def baseline_db_update(filepath, sha256):
+    """Update single file entry after change (re-baseline after alert)."""
+    db = sqlite3.connect(_get_baseline_db())
+    baseline_db_init()
+    try:
+        st = os.stat(filepath)
+        sz = st.st_size
+        mt = st.st_mtime
+    except OSError:
+        sz = 0
+        mt = time.time()
+    db.execute(
+        """INSERT OR REPLACE INTO baseline (filepath, sha256, size, mtime, added_at)
+           VALUES (?, ?, ?, ?, datetime('now'))""",
+        (filepath, sha256, sz, mt)
+    )
+    db.commit()
+    db.close()
+
+
+def baseline_db_remove(filepath):
+    """Remove a deleted file from baseline."""
+    db = sqlite3.connect(_get_baseline_db())
+    db.execute("DELETE FROM baseline WHERE filepath = ?", (filepath,))
+    db.commit()
+    db.close()
+
+
+def baseline_db_new_files(dirs):
+    """Return files that exist on disk but NOT in baseline."""
+    new_files = []
+    db_path = _get_baseline_db()
+    known = set()
+    if os.path.exists(db_path):
+        try:
+            db = sqlite3.connect(db_path)
+            rows = db.execute("SELECT filepath FROM baseline").fetchall()
+            known = {r[0] for r in rows}
+            db.close()
+        except Exception:
+            pass
+
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for f in files:
+                fp = os.path.join(root, f)
+                ext = os.path.splitext(f)[1].lower()
+                if ext in SCAN_EXTENSIONS and fp not in known:
+                    new_files.append(fp)
+    return new_files
+
+
+def build_baseline(dirs):
+    """Build initial hash baseline for all scannable files. Persists to SQLite."""
+    baseline = {}
+    baseline_db_init()
     for d in dirs:
         for root, _, files in os.walk(d):
             for f in files:
@@ -508,12 +641,14 @@ def build_baseline(dirs):
                     file_hash = hash_file(fp)
                     if file_hash:
                         baseline[fp] = file_hash
+    baseline_db_save(baseline)
     return baseline
 
 
 def scan_files(dirs, baseline=None):
     """Scan watched directories for threats. Returns list of findings."""
     findings = []
+    scanned_paths = set()
 
     for d in dirs:
         if not os.path.isdir(d):
@@ -539,7 +674,23 @@ def scan_files(dirs, baseline=None):
                 if ext not in SCAN_EXTENSIONS:
                     continue
 
-                # Check baseline (file tampering)
+                scanned_paths.add(fp)
+
+                # Check baseline: new file (exists on disk, not in baseline)
+                if baseline and fp not in baseline:
+                    current_hash = hash_file(fp)
+                    if current_hash:
+                        findings.append({
+                            "type": "new_file",
+                            "file": fp,
+                            "detail": "New file detected — not in baseline snapshot",
+                            "severity": "medium",
+                        })
+                        # Auto-add to baseline so it only alerts once
+                        baseline_db_update(fp, current_hash)
+                        baseline[fp] = current_hash
+
+                # Check baseline: file modified
                 if baseline and fp in baseline:
                     current_hash = hash_file(fp)
                     if current_hash and current_hash != baseline[fp]:
@@ -549,6 +700,9 @@ def scan_files(dirs, baseline=None):
                             "detail": "File hash changed from baseline",
                             "severity": "medium",
                         })
+                        # Re-baseline so same change doesn't alert again
+                        baseline_db_update(fp, current_hash)
+                        baseline[fp] = current_hash
 
                 # Read and scan file content
                 try:
@@ -591,6 +745,31 @@ def scan_files(dirs, baseline=None):
                             "severity": "high",
                         })
 
+    return findings, scanned_paths
+
+# ─── Scan: detect files deleted from baseline ────────────────────
+
+def scan_deleted_files(scanned_paths):
+    """Detect files in baseline that no longer exist on disk."""
+    findings = []
+    db_path = _get_baseline_db()
+    if not os.path.exists(db_path):
+        return findings
+    try:
+        db = sqlite3.connect(db_path)
+        rows = db.execute("SELECT filepath FROM baseline").fetchall()
+        db.close()
+        for (fp,) in rows:
+            if fp not in scanned_paths and not os.path.exists(fp):
+                findings.append({
+                    "type": "file_deleted",
+                    "file": fp,
+                    "detail": "Baseline file no longer exists on disk",
+                    "severity": "low",
+                })
+                baseline_db_remove(fp)
+    except Exception:
+        pass
     return findings
 
 
@@ -704,6 +883,11 @@ def main():
     # Load config — simple YAML-like format
     config = _load_config(args.config)
 
+    # Set baseline DB location next to config file (writable, survives restarts)
+    config_dir = os.path.dirname(os.path.abspath(args.config))
+    global _BASELINE_DB_FILE
+    _BASELINE_DB_FILE = os.path.join(config_dir, "baseline.db")
+
     watch_dirs = config.get("watch_dirs", ["/var/www"])
     interval = int(config.get("interval", 300))
     baseline = {}
@@ -712,14 +896,20 @@ def main():
     rule_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules")
     rule_packs = _load_rule_packs(rule_dir)
 
+    # Load persistent baseline from SQLite
+    baseline_db_init()
+    baseline = baseline_db_load()
+    if baseline:
+        print(f"[sentinel] Loaded persistent baseline: {len(baseline)} files from baseline.db")
+
     if config.get("baseline_on_start", True):
         print(f"[sentinel] Building baseline for {len(watch_dirs)} directories...")
         baseline = build_baseline(watch_dirs)
-        print(f"[sentinel] Baseline: {len(baseline)} files")
+        print(f"[sentinel] Baseline: {len(baseline)} files saved to baseline.db")
 
     # Single scan mode (for cron usage)
     if args.scan_once or args.json:
-        findings = scan_files(watch_dirs, baseline)
+        findings, scanned_paths = scan_files(watch_dirs, baseline)
         findings.extend(scan_crontabs())
         findings.extend(scan_recent_files(watch_dirs, minutes=60))
         findings.extend(scan_cryptominers(watch_dirs))
@@ -729,6 +919,7 @@ def main():
         findings.extend(scan_cloned_malware(watch_dirs))
         if rule_packs:
             findings.extend(scan_rule_packs(watch_dirs, rule_packs))
+        findings.extend(scan_deleted_files(scanned_paths))
 
         if args.json:
             print(json.dumps(findings, indent=2, ensure_ascii=False))
@@ -747,7 +938,7 @@ def main():
     while True:
         try:
             print(f"[sentinel] Scanning... ({time.strftime('%H:%M:%S')})")
-            findings = scan_files(watch_dirs, baseline)
+            findings, scanned_paths = scan_files(watch_dirs, baseline)
             findings.extend(scan_crontabs())
             findings.extend(scan_recent_files(watch_dirs, minutes=interval // 60))
             findings.extend(scan_cryptominers(watch_dirs))
@@ -757,6 +948,7 @@ def main():
             findings.extend(scan_cloned_malware(watch_dirs))
             if rule_packs:
                 findings.extend(scan_rule_packs(watch_dirs, rule_packs))
+            findings.extend(scan_deleted_files(scanned_paths))
 
             if findings:
                 print(f"[sentinel] {len(findings)} findings detected")
