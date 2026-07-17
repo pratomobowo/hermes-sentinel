@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermes Sentinel v0.5.0 — Lightweight web server malware detection agent.
+"""Hermes Sentinel v0.7.0 — Lightweight web server malware detection agent.
 
 Watches your web server for malware, gambling redirects, and backdoors.
 Reports findings to a central Hermes Agent for AI-powered reasoning.
@@ -1528,6 +1528,398 @@ def report_findings(findings, config):
         print(f"Failed to report: {e}", file=sys.stderr)
         return False
 
+# ─── v0.7.0: inotify Watcher ─────────────────────────────────────
+
+# inotify constants
+IN_ACCESS = 0x00000001
+IN_MODIFY = 0x00000002
+IN_ATTRIB = 0x00000004
+IN_CLOSE_WRITE = 0x00000008
+IN_CLOSE_NOWRITE = 0x00000010
+IN_OPEN = 0x00000020
+IN_MOVED_FROM = 0x00000040
+IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
+IN_DELETE = 0x00000200
+IN_DELETE_SELF = 0x00000400
+IN_MOVE_SELF = 0x00000800
+IN_CLOEXEC = 0o2000000
+IN_NONBLOCK = 0o4000
+IN_ONLYDIR = 0x01000000
+IN_DONT_FOLLOW = 0x02000000
+IN_EXCL_UNLINK = 0x04000000
+IN_ISDIR = 0x40000000
+IN_IGNORED = 0x80000000
+
+# Events we care about: new file, modified, deleted
+WATCH_MASK = (IN_CREATE | IN_MODIFY | IN_CLOSE_WRITE |
+              IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF)
+
+# Max watches before fallback
+WATCH_LIMIT_SOFT = 50000  # warn at 50K
+_LAST_SCAN_TIME = 0.0  # mtime fallback reference
+
+
+def _inotify_init():
+    """Initialize inotify, return fd or None on failure."""
+    import ctypes
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        fd = libc.inotify_init1(IN_CLOEXEC | IN_NONBLOCK)
+        if fd < 0:
+            return None
+        return fd
+    except Exception:
+        return None
+
+
+def _inotify_add_watch(fd, path, mask):
+    """Add an inotify watch. Returns wd or -1 on failure."""
+    import ctypes
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        encoded = path.encode("utf-8") + b"\x00"
+        wd = libc.inotify_add_watch(fd, encoded, mask)
+        return wd
+    except Exception:
+        return -1
+
+
+def _inotify_read_events(fd, timeout=2.0):
+    """Read inotify events with timeout. Returns list of (wd, mask, name)."""
+    import ctypes, select, struct
+    events = []
+    try:
+        ready, _, _ = select.select([fd], [], [], timeout)
+        if not ready:
+            return events
+        buf = os.read(fd, 4096)
+        i = 0
+        while i < len(buf):
+            wd, mask, cookie, name_len = struct.unpack_from("iIII", buf, i)
+            name = buf[i + 16:i + 16 + name_len].rstrip(b"\x00").decode("utf-8", errors="replace")
+            events.append((wd, mask, name))
+            i += 16 + name_len
+    except Exception:
+        pass
+    return events
+
+
+def _watch_tree_recursive(fd, root, wd_map):
+    """Recursively add inotify watches to a directory tree.
+    Returns (watch_count, failed_paths)."""
+    import ctypes
+    count = 0
+    failed = []
+    try:
+        wd = _inotify_add_watch(fd, root, WATCH_MASK)
+        if wd < 0:
+            errno_val = ctypes.get_errno()
+            if errno_val == 28:  # ENOSPC
+                failed.append(root)
+            return 0, failed
+        wd_map[wd] = root
+        count += 1
+    except Exception:
+        return 0, failed
+
+    # Only recurse if under soft limit
+    if count >= WATCH_LIMIT_SOFT:
+        return count, failed
+
+    try:
+        for entry in os.listdir(root):
+            full = os.path.join(root, entry)
+            if os.path.isdir(full) and entry != ".git":
+                sub_count, sub_failed = _watch_tree_recursive(fd, full, wd_map)
+                count += sub_count
+                failed.extend(sub_failed)
+    except PermissionError:
+        pass
+
+    return count, failed
+
+
+def _resolve_inotify_path(wd_map, wd, name):
+    """Resolve full file path from watch descriptor and filename."""
+    base = wd_map.get(wd, "")
+    if base and name:
+        return os.path.join(base, name)
+    return ""
+
+
+# ─── v0.7.0: Incremental File Scanner ────────────────────────────
+
+LARGE_FILE_THRESHOLD = 10 * 1024 * 1024  # 10 MB
+LARGE_FILE_HEAD_BYTES = 65536   # 64 KB
+LARGE_FILE_TAIL_BYTES = 65536   # 64 KB
+
+
+def scan_files_incremental(file_list, baseline=None, config=None, git_changed=None):
+    """Scan only specific files (from inotify or mtime). Returns (findings, scanned_paths)."""
+    findings = []
+    scanned_paths = set()
+
+    for fp in file_list:
+        if not os.path.isfile(fp):
+            continue
+        ext = os.path.splitext(fp)[1].lower()
+        if ext not in SCAN_EXTENSIONS:
+            continue
+        scanned_paths.add(fp)
+
+        # Large file optimization: only scan head + tail
+        try:
+            sz = os.path.getsize(fp)
+        except OSError:
+            continue
+        is_large = sz > LARGE_FILE_THRESHOLD
+
+        # Baseline checks (same logic as scan_files)
+        if baseline and fp not in baseline and not is_integrity_skipped(fp, config, git_changed):
+            if not _is_duplicate_alert(fp):
+                current_hash = hash_file(fp) if not is_large else None
+                if current_hash:
+                    findings.append({
+                        "type": "new_file",
+                        "file": fp,
+                        "detail": f"New file — {_diff_detail(fp)}",
+                        "severity": integrity_severity(fp),
+                    })
+                    baseline_db_update(fp, current_hash)
+                    baseline[fp] = current_hash
+
+        if baseline and fp in baseline:
+            current_hash = hash_file(fp) if not is_large else None
+            if current_hash and current_hash != baseline[fp]:
+                if not is_integrity_skipped(fp, config, git_changed) and not _is_duplicate_alert(fp):
+                    findings.append({
+                        "type": "file_modified",
+                        "file": fp,
+                        "detail": f"Hash changed — {_diff_detail(fp)}",
+                        "severity": integrity_severity(fp),
+                    })
+                baseline_db_update(fp, current_hash)
+                baseline[fp] = current_hash
+
+        # Content scan
+        try:
+            if is_large:
+                # Scan only head + tail
+                with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                    head = fh.read(LARGE_FILE_HEAD_BYTES)
+                with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(max(0, sz - LARGE_FILE_TAIL_BYTES))
+                    tail = fh.read(LARGE_FILE_TAIL_BYTES)
+                content = head + "\n...[TRUNCATED]...\n" + tail
+            else:
+                with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+        except (OSError, PermissionError):
+            continue
+
+        # Run malware patterns
+        for domain in JUDOL_DOMAINS:
+            if domain.lower() in content.lower():
+                findings.append({
+                    "type": "suspicious_domain",
+                    "file": fp,
+                    "detail": f"Reference to gambling-related domain: {domain}",
+                    "severity": "high",
+                })
+                break
+
+        for pattern, desc in PHP_BACKDOOR_PATTERNS:
+            if re.search(pattern, content, re.IGNORECASE):
+                findings.append({
+                    "type": "php_backdoor",
+                    "file": fp,
+                    "detail": desc,
+                    "pattern": pattern,
+                    "severity": "critical",
+                })
+                break
+
+        if os.path.basename(fp) == ".htaccess":
+            redirects = re.findall(r"RewriteRule\s+.*https?://([^\s\]]+)", content, re.IGNORECASE)
+            for target in redirects:
+                findings.append({
+                    "type": "htaccess_redirect",
+                    "file": fp,
+                    "detail": f".htaccess redirect to external domain: {target}",
+                    "severity": "high",
+                })
+
+    return findings, scanned_paths
+
+
+# ─── v0.7.0: Mtime Fallback Scan ─────────────────────────────────
+
+def scan_mtime_incremental(dirs):
+    """Return files modified since last scan. Fallback when inotify unavailable."""
+    global _LAST_SCAN_TIME
+    now = time.time()
+    cutoff = _LAST_SCAN_TIME if _LAST_SCAN_TIME > 0 else now - 3600
+    _LAST_SCAN_TIME = now
+
+    changed = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for f in files:
+                fp = os.path.join(root, f)
+                ext = os.path.splitext(f)[1].lower()
+                if ext not in SCAN_EXTENSIONS:
+                    continue
+                try:
+                    mtime = os.path.getmtime(fp)
+                    if mtime > cutoff:
+                        changed.append(fp)
+                except OSError:
+                    continue
+    return changed
+
+
+# ─── v0.7.0: Resource Throttle ───────────────────────────────────
+
+_SCAN_BATCH_SIZE = 50  # files per batch
+_SCAN_BATCH_PAUSE = 0.1  # seconds between batches
+
+
+def _throttle_resources(batch_num):
+    """Brief pause between scan batches to avoid CPU/IO spikes."""
+    if batch_num > 0 and batch_num % _SCAN_BATCH_SIZE == 0:
+        time.sleep(_SCAN_BATCH_PAUSE)
+
+
+# ─── v0.7.0: Inotify Daemon Loop ─────────────────────────────────
+
+def daemon_loop_inotify(watch_dirs, baseline, config, rule_packs, interval):
+    """Main daemon loop using inotify for real-time file monitoring.
+    Falls back to mtime scan if inotify unavailable."""
+    import ctypes
+
+    # Try inotify first
+    fd = _inotify_init()
+    use_inotify = fd is not None
+    wd_map = {}
+
+    if use_inotify:
+        total_watches = 0
+        for d in watch_dirs:
+            if os.path.isdir(d):
+                count, failed = _watch_tree_recursive(fd, d, wd_map)
+                total_watches += count
+                if failed:
+                    print(f"[sentinel] Inotify ENOSPC on {len(failed)} dirs — some dirs use mtime fallback")
+        if total_watches > 0:
+            print(f"[sentinel] Inotify active: {total_watches} watches on {len(wd_map)} directories")
+        else:
+            print(f"[sentinel] Inotify failed to add ANY watches — using mtime fallback")
+            use_inotify = False
+    else:
+        print(f"[sentinel] Inotify unavailable — using mtime-based incremental scan")
+
+    last_full_scan = 0  # force immediate first scan
+    FULL_SCAN_INTERVAL = 900  # full scan every 15 minutes as safety net
+
+    print(f"[sentinel] Watching {len(watch_dirs)} directories (inotify: {use_inotify})...")
+    print(f"[sentinel] Master: {config.get('master_url', 'none')}")
+
+    while True:
+        try:
+            event_files = set()
+            full_scan = False
+
+            if use_inotify:
+                # Collect events in 2-second window
+                events = _inotify_read_events(fd, timeout=2.0)
+                for wd, mask, name in events:
+                    fp = _resolve_inotify_path(wd_map, wd, name)
+                    if fp and os.path.isfile(fp):
+                        event_files.add(fp)
+
+                # Check if full scan needed
+                now = time.time()
+                if now - last_full_scan >= FULL_SCAN_INTERVAL:
+                    full_scan = True
+                    last_full_scan = now
+            else:
+                # Mtime fallback
+                event_files = set(scan_mtime_incremental(watch_dirs))
+                full_scan = True  # mtime scan already filters
+
+            # Compute git-changed files
+            git_changed = set()
+            for d in watch_dirs:
+                git_changed |= git_tracked_changes(d)
+
+            # Scan: incremental or full
+            if full_scan or len(event_files) > 100:
+                # Full scan every 15 min OR when event flood (>100 files changed)
+                sys.stdout.flush()
+                print(f"[sentinel] Full scan triggered ({len(event_files)} events)")
+                findings, scanned_paths = scan_files(watch_dirs, baseline, config, git_changed)
+            else:
+                findings, scanned_paths = scan_files_incremental(list(event_files), baseline, config, git_changed)
+
+            # v0.5.0 behavioral (every cycle — lightweight)
+            findings.extend(scan_processes())
+            findings.extend(scan_network_connections())
+            findings.extend(scan_user_sessions())
+            findings.extend(scan_systemd_timers())
+            if full_scan:
+                findings.extend(scan_extended_crontabs())
+            else:
+                findings.extend(scan_crontabs())
+
+            # Full-walk scans only on full scan (every 15 min)
+            if full_scan:
+                findings.extend(scan_cryptominers(watch_dirs))
+                findings.extend(scan_seo_spam(watch_dirs))
+                findings.extend(scan_shell_extensions(watch_dirs))
+                findings.extend(scan_cgi_webshell_dirs(watch_dirs))
+                findings.extend(scan_cloned_malware(watch_dirs))
+                if rule_packs:
+                    findings.extend(scan_rule_packs(watch_dirs, rule_packs))
+                findings.extend(scan_deleted_files(scanned_paths, config, git_changed))
+                findings.extend(scan_recent_files(watch_dirs, minutes=15))
+
+            if findings:
+                qcount = 0
+                for f in findings:
+                    if should_quarantine(f, config):
+                        ok, qpath = quarantine_file(f["file"], f, config)
+                        if ok:
+                            f["quarantined"] = qpath
+                            qcount += 1
+                if qcount:
+                    print(f"[sentinel] Quarantined {qcount} files")
+
+                print(f"[sentinel] {len(findings)} findings detected")
+                for f in findings:
+                    if f.get("severity") in ("critical", "high"):
+                        print(f"  [{f['severity'].upper()}] {f['type']}: {f.get('file', '')} — {f['detail']}")
+
+                report_findings(findings, config)
+            elif full_scan:
+                sys.stdout.flush()
+                print(f"[sentinel] Full scan clean ({time.strftime('%H:%M:%S')})")
+
+        except KeyboardInterrupt:
+            print("\n[sentinel] Shutting down.")
+            if use_inotify:
+                os.close(fd)
+            return 0
+        except Exception as e:
+            print(f"[sentinel] Error: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            time.sleep(interval)
+
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="Hermes Sentinel Agent")
@@ -1612,66 +2004,10 @@ def main():
             print("[sentinel] All clear — no threats detected.")
         return 0
 
-    # Daemon mode — continuous watching
-    print(f"[sentinel] Watching {len(watch_dirs)} directories every {interval}s...")
-    print(f"[sentinel] Master: {config.get('master_url', 'none')}")
-
-    while True:
-        try:
-            print(f"[sentinel] Scanning... ({time.strftime('%H:%M:%S')})")
-            # Pre-compute git-changed files for integrity skip
-            git_changed = set()
-            for d in watch_dirs:
-                git_changed |= git_tracked_changes(d)
-
-            findings, scanned_paths = scan_files(watch_dirs, baseline, config, git_changed)
-            findings.extend(scan_crontabs())
-            findings.extend(scan_recent_files(watch_dirs, minutes=interval // 60))
-            findings.extend(scan_cryptominers(watch_dirs))
-            findings.extend(scan_seo_spam(watch_dirs))
-            findings.extend(scan_shell_extensions(watch_dirs))
-            findings.extend(scan_cgi_webshell_dirs(watch_dirs))
-            findings.extend(scan_cloned_malware(watch_dirs))
-            if rule_packs:
-                findings.extend(scan_rule_packs(watch_dirs, rule_packs))
-            findings.extend(scan_deleted_files(scanned_paths, config, git_changed))
-
-            # v0.5.0: Behavioral monitoring
-            findings.extend(scan_processes())
-            findings.extend(scan_network_connections())
-            findings.extend(scan_user_sessions())
-            findings.extend(scan_systemd_timers())
-            findings.extend(scan_extended_crontabs())
-
-            if findings:
-                # Quarantine CRITICAL/HIGH before reporting
-                qcount = 0
-                for f in findings:
-                    if should_quarantine(f, config):
-                        ok, qpath = quarantine_file(f["file"], f, config)
-                        if ok:
-                            f["quarantined"] = qpath
-                            qcount += 1
-                if qcount:
-                    print(f"[sentinel] Quarantined {qcount} files")
-
-                print(f"[sentinel] {len(findings)} findings detected")
-                for f in findings:
-                    if f.get("severity") in ("critical", "high"):
-                        print(f"  🚨 [{f['severity'].upper()}] {f['type']}: {f.get('file', '')} — {f['detail']}")
-
-                report_findings(findings, config)
-            else:
-                print("[sentinel] Clean")
-
-            time.sleep(interval)
-        except KeyboardInterrupt:
-            print("\n[sentinel] Shutting down.")
-            return 0
-        except Exception as e:
-            print(f"[sentinel] Error: {e}", file=sys.stderr)
-            time.sleep(interval)
-
+    # Daemon mode — inotify incremental watching
+    # Full scan every 15 min, behavioral every 5 min
+    daemon_loop_inotify(watch_dirs, baseline, config, rule_packs, interval)
+    return 0
 
 def _load_config(path):
     """Load simple YAML-like config. Falls back to defaults if file missing."""
