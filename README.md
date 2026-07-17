@@ -1,29 +1,59 @@
 # Hermes Sentinel
 
-**Lightweight malware detection agents.** Install on any web server. Detects gambling injections, backdoors, cryptominers, SEO spam. Silent when clean — reports to your Hermes Agent for AI-powered alerts. Optionally auto-quarantines threats.
+**Lightweight malware detection agent.** Install on any web server. Detects gambling injections, backdoors, cryptominers, SEO spam, reverse shells, brute force attacks. **Satellite decides, Hermes oversees.**
+
+> Single Python file. Stdlib only. Zero dependencies. Zero inbound ports.
+
+## Architecture: Satellite Decides, Hermes Oversees
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  SERVER CLIENT (remote)                    ZERO INBOUND PORTS    │
+│                                                                   │
+│  Sentinel scan loop:                                              │
+│    1. detect → findings (pattern + behavioral)                    │
+│    2. auto-respond → quarantine/kill (configurable)               │
+│    3. POST /report ──────────────→ Hermes                         │
+│    4. GET  /commands?server=X ───→ Hermes (poll safe commands)    │
+│                                                                   │
+│  Sentinel has FULL CONTEXT: file content, process tree, network.  │
+│  It decides what's dangerous. Hermes can't send destructive       │
+│  commands — only administrative (rescan, status, whitelist, undo).│
+└──────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  HERMES MASTER (your server)                                      │
+│                                                                   │
+│  Receives reports → AI reasoning → Telegram alert                 │
+│  Admin via Telegram: "quarantine X" → Hermes puts in command queue│
+│  Sentinel polls queue → executes safe commands → reports back     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Why This Architecture
+
+| | Sentinel (on server) | Hermes (central) |
+|---|---|---|
+| **Detection** | ✅ Full context: files, processes, network | ❌ Only sees JSON summary |
+| **Action** | ✅ Auto-quarantine, auto-kill, auto-block | ❌ No context |
+| **Reports** | ✅ Sends findings to Hermes | ✅ Receives + forwards to Telegram |
+| **Safe commands** | ✅ Rescan, status, whitelist, rebuild, undo | ✅ Admin request via Telegram |
 
 ---
 
-## The Architecture (Two Separate Servers)
+## Roadmap
 
-```
-┌─────────────────────────────────┐     ┌──────────────────────────────────┐
-│  Your Client's Server            │     │  Your Server (Hermes Master)     │
-│  (Satellite Agent)               │     │                                  │
-│                                  │     │  hermes config set ...           │
-│  curl | bash  ← install          │     │  hermes webhook subscribe ...   │
-│  systemctl start sentinel        │     │  hermes gateway restart         │
-│                                  │     │                                  │
-│  Runs: hermes-sentinel.py        │────▶│  Receives: POST /webhooks/      │
-│  Scans: /var/www every 5min      │     │            sentinel             │
-│  Sends: JSON to webhook          │     │  AI analyzes findings           │
-│                                  │     │  Sends Telegram alert to you    │
-│  Needs: ONLY Python 3            │     │  Needs: Hermes Agent installed  │
-│  Does NOT need Hermes            │     │  Needs: Telegram connected      │
-└─────────────────────────────────┘     └──────────────────────────────────┘
-```
-
-**The satellite does NOT need Hermes.** It's a single Python file. It just sends scan results to your Hermes server via HTTP.
+| Version | Focus | Status |
+|---------|-------|:------:|
+| v0.3.0 | Pattern matcher + quarantine | ✅ Baseline |
+| **v0.4.0** | Smart integrity: git-aware, whitelist, dedup, severity, diff | ✅ Shipped |
+| **v0.5.0** | Behavioral: process scanner, network monitor, user session, cron/timer | ✅ Shipped |
+| **v0.7.0** | Incremental scan: inotify real-time, mtime fallback, large file optimization | ✅ Shipped |
+| **v0.7.1** | Behavioral dedup with SQLite persistence across scan-once restarts | ✅ Shipped |
+| **v0.9.0** | Command & Control: two-way Sentinel ↔ Hermes, safe command queue | 🚧 Next |
+| **v0.8.0** | Correlation engine: incident grouping, kill chain detection | 📋 Planned |
+| **v1.0.0** | Production: dashboard, heartbeat, auto-update, plugin system | 📋 Planned |
 
 ---
 
@@ -98,57 +128,81 @@ You should get a Telegram alert from Hermes analyzing the test report.
 
 ## Detection Engine
 
-### 18 Detection Categories (v0.2.0)
+### 21+ Detection Categories
 
-| # | Category | Rule Pack | Severity |
-|---|----------|-----------|----------|
-| 1 | Gambling domain injection | `judol.yaml` | High |
-| 2 | Remote C2 code loader (base64 → eval) | `backdoor.yaml` | Critical |
-| 3 | Password-gated file uploaders (.logs/.cache/.storage/) | `backdoor.yaml` | Critical |
-| 4 | gzuncompress → eval chain (VATHAN signature) | `backdoor.yaml` | Critical |
-| 5 | Known attacker C2 domains (megaranger.store, etc.) | `backdoor.yaml` | Critical |
-| 6 | CGI webshell directories (ALFA/Eren/jancx) | `backdoor.yaml` | Critical |
-| 7 | Obfuscated 5.8MB webshell (fake @package header) | `webshell.yaml` | Critical |
-| 8 | PHP files in JS/CSS/Images/Locale directories | `webshell.yaml` | High |
-| 9 | File manager webshell (35KB-160KB base64 chain) | `webshell.yaml` | Critical |
-| 10 | Generic tech name disguises (45 patterns) | `webshell.yaml` | Medium |
-| 11 | Identical file cloned across 3+ directories | `webshell.yaml` | Critical |
-| 12 | Crypto miner binary + config | `cryptominer.yaml` | Critical |
-| 13 | Kernel process masquerade (exec -a [kswapd0]) | `cryptominer.yaml` | Critical |
-| 14 | Cron miner persistence (every hour re-launch) | `cryptominer.yaml` | Critical |
-| 15 | SEO spam home.php (100KB+ gambling keywords) | `seo-spam.yaml` | High |
-| 16 | Index.php GoogleBot cloaking | `seo-spam.yaml` | Critical |
-| 17 | REP/MAR auto-generated spam HTML | `seo-spam.yaml` | Medium |
-| 18 | .phtml/.phar upload filter bypass | Agent core | Critical |
+| # | Category | Severity | Detection Method |
+|---|----------|:--------:|------------------|
+| 1 | Gambling domain injection | High | Content pattern |
+| 2 | Remote C2 code loader (base64 → eval) | Critical | Content pattern |
+| 3 | Password-gated file uploaders | Critical | Content pattern |
+| 4 | gzuncompress → eval chain (VATHAN) | Critical | Content pattern |
+| 5 | CGI webshell directories (ALFA/Eren/jancx) | Critical | Path pattern |
+| 6 | Obfuscated webshell (fake @package) | Critical | Content + size |
+| 7 | PHP in JS/CSS/Images dirs | High | Path pattern |
+| 8 | File manager webshell (base64 chain) | Critical | Content pattern |
+| 9 | Tech name disguises (45 patterns) | Medium | Content pattern |
+| 10 | Cloned malware (3+ identical files) | Critical | File hash |
+| 11 | Crypto miner binary + config | Critical | Filename + process |
+| 12 | Kernel masquerade (exec -a [kswapd0]) | Critical | Process scanner |
+| 13 | Cron miner persistence | Critical | Cron scanner |
+| 14 | SEO spam home.php (100KB+) | High | Size + content |
+| 15 | GoogleBot cloaking | Critical | Content pattern |
+| 16 | REP/MAR spam HTML | Medium | Filename pattern |
+| 17 | Upload filter bypass (.phtml/.phar) | Critical | Extension check |
+| 18 | Reverse shell (/dev/tcp/) | Critical | Process scanner |
+| 19 | Botnet port outbound (IRC 6667, etc.) | High | Network scanner |
+| 20 | SSH brute force (10+ failures) | High | User session scanner |
+| 21 | New listening port (backdoor) | High | Network delta |
 
-### File Integrity Monitoring (v0.4.0 — Smart Integrity)
+### Smart Integrity (v0.4.0 — v0.7.1)
 
-Persistent SHA256 baseline via SQLite. Survives daemon restarts and reboots.
+| Feature | Detail |
+|---------|--------|
+| **Git-aware** | `git pull`/checkout = silent. Only alert uncommitted changes |
+| **Whitelist** | `integrity_whitelist` glob patterns (vendor/*, *.lock) |
+| **Alert dedup** | SQLite-persisted. Same event = 1 alert in window. Survives restarts |
+| **Path severity** | `/images/` → HIGH, `/vendor/` → LOW, everything else → MEDIUM |
+| **Diff output** | `"Hash changed — 142 lines, 4821 bytes"` |
+| **Volatile exclude** | cache/, tmp/, logs/, sessions/ — skip integrity, keep malware scan |
 
-| Detection | Severity | Description |
-|-----------|----------|-------------|
-| `file_modified` | Path-based ↓ | Hash changed from baseline |
-| `new_file` | Path-based ↓ | New file appeared (not in baseline) |
-| `file_deleted` | Low | Baseline file disappeared from disk |
+### Behavioral Monitoring (v0.5.0)
+- **Process scanner:** `/proc/*/cmdline` — reverse shells, Python exec, shell spawned by nginx
+- **Network monitor:** `/proc/net/tcp` — botnet ports, high-port outbound, new listeners
+- **User session:** new users, root SSH, odd-hour login, brute force
+- **Systemd timer:** new `.timer` files via SQLite delta
+- **Extended cron:** `/etc/crontab` + `/etc/cron.d/` delta
 
-**Smart severity:** `/images/` / `/uploads/` → HIGH, `/vendor/` / `/node_modules/` → LOW, everything else → MEDIUM. Each integrity alert includes a diff summary (line count + size).
-
-**v0.4.0 Noise Reduction:**
-
-| Feature | Description |
-|---------|-------------|
-| **Git-aware** | Tracks git HEAD via SQLite. Files changed by `git pull`/checkout skip integrity alerts — only alert on uncommitted changes |
-| **Whitelist** | `integrity_whitelist` patterns in config (glob or path). `public/app.js`, `vendor/*`, etc. |
-| **Alert dedup** | Same file = 1 alert in 10 minutes. Modified 3x → 1 alert, not 3 |
-| **Diff output** | `file_modified` now shows: `"Hash changed — 142 lines, 4821 bytes"` |
-
-### Optional: Auto-Quarantine
-
-When `quarantine: true` is set, CRITICAL and HIGH severity files are automatically moved to `/etc/hermes-sentinel/quarantine/<timestamp>/`. Each file gets a `.meta.json` with original path, severity, and detection type — so you can always restore. Audit trail logged to SQLite.
+### Incremental Scanning (v0.7.0)
+- **inotify:** Linux kernel events for real-time file monitoring
+- **mtime fallback:** when inotify unavailable or max watches exceeded
+- **Large file optimization:** >10MB → scan head+tail only
+- **Full scan safety net:** every 15 minutes ensures no missed changes
 
 ---
 
-## Commands (on Satellite)
+## Configuration
+
+```yaml
+# /etc/hermes-sentinel/config.yaml
+server_name: "web-01"                                          # Identifier in alerts
+master_url: "http://YOUR-HERMES-IP:8644/webhooks/sentinel"    # Hermes webhook
+secret: "shared-secret"                                        # Same as webhook HMAC
+watch_dirs:                                                    # Directories to monitor
+  - /var/www
+interval: 300                                                  # Seconds between scans (daemon poll interval)
+baseline_on_start: true                                        # Build SHA256 baseline
+quarantine: false                                              # Auto-isolate CRITICAL+HIGH threats
+integrity_excludes:                                            # Skip integrity for volatile dirs
+  - /var/www/app/cache/
+  - "*.log"
+integrity_whitelist:                                           # Skip integrity for known-safe files
+  - composer.lock
+  - "vendor/*"
+```
+
+---
+
+## Commands
 
 ```bash
 # One-time scan
@@ -171,68 +225,6 @@ sqlite3 /etc/hermes-sentinel/baseline.db "SELECT * FROM quarantine_log ORDER BY 
 
 ---
 
-## Configuration
-
-```yaml
-# /etc/hermes-sentinel/config.yaml
-server_name: "web-01"                                          # Identifier in alerts
-master_url: "http://YOUR-HERMES-IP:8644/webhooks/sentinel"    # Hermes webhook
-secret: "shared-secret"                                        # Same as webhook HMAC
-watch_dirs:                                                    # Directories to monitor
-  - /var/www
-  - /var/www/other-site
-interval: 300                                                  # Seconds between scans
-baseline_on_start: true                                        # Build SHA256 baseline
-quarantine: false                                              # Auto-isolate CRITICAL+HIGH threats
-integrity_excludes:                                            # Skip integrity check for volatile dirs
-  - /var/www/app/cache/
-  - "*.log"
-  - "*.lock"
-integrity_whitelist:                                           # v0.4.0: skip integrity for known-safe files
-  - composer.lock
-  - package-lock.json
-  - "public/app.js"
-  - "vendor/*"
-```
-
-**Built-in integrity excludes** (always active): `cache/`, `tmp/`, `logs/`, `sessions/`, `compiled/`, `*.log`, `*.cache`, `*.lock`, `*.pid`, `*.tmp`
-
-These suppress `file_modified`, `new_file`, and `file_deleted` alerts for volatile files — but **malware content scanning still runs**. A backdoor in `/var/www/cache/evil.php` will still be detected as CRITICAL, just without the accompanying "file changed" noise.
-
-**Persistent baseline** is stored at `/etc/hermes-sentinel/baseline.db` (SQLite). Survives restarts and reboots — no rebuild needed unless `baseline_on_start: true`.
-
----
-
-## Rule Packs
-
-Detection rules are modular YAML in `rules/`. Extend without touching code:
-
-```
-rules/
-├── judol.yaml        # Gambling injection (16 keywords)
-├── backdoor.yaml     # Remote C2, password uploaders, CGI webshells, C2 domains
-├── webshell.yaml     # 5.8MB obfuscated, .php in wrong dirs, name disguise, clone detection
-├── cryptominer.yaml  # XMRig binary, kernel masquerade, cron persistence
-├── seo-spam.yaml     # Cloaked index.php, spam HTML, gambling blogs
-└── vuln-scan.yaml    # mysql exposed, allow_url_fopen, root SSH
-```
-
-Rule packs support: `search_terms`, `regex`, `combined_regex`, `domains`, `file_pattern`, `path_pattern`, `naming_pattern`, `size_kb_min/max`, `must_also_contain`, and nested `triggers`.
-
----
-
-## Real-World Battle Test
-
-v0.2.0 rules were built from forensic analysis of a real server compromise:
-
-- **~120 malware files** across 3 months of attacks
-- **Attacker IPs:** 116.212.128.214 (Cambodia), 103.87.68.151, 103.132.8.4
-- **C2 Server:** `megaranger.store`
-- **Signatures:** `VATHAN VS EVERYBODY`, `Coded By Sole Sad & Invisible`
-- **Attack chain:** SLiMS plugin upload → webshell → OJS lateral → cryptominer → SEO spam
-
----
-
 ## Why Not Wazuh?
 
 | | Wazuh | Hermes Sentinel |
@@ -242,6 +234,7 @@ v0.2.0 rules were built from forensic analysis of a real server compromise:
 | **Dependencies** | Java, ES, Filebeat | Python 3 only |
 | **AI reasoning** | Manual rule tuning | LLM via Hermes |
 | **Telegram alerts** | DIY webhook setup | Built-in |
+| **Attack surface** | Agent opens ports | Zero inbound ports |
 
 ---
 
