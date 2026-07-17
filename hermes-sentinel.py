@@ -66,15 +66,20 @@ def _load_rule_packs(rule_dir=None):
     if not os.path.isdir(rule_dir):
         return packs
 
+    yaml_loaded = False
     for fname in sorted(os.listdir(rule_dir)):
         if not fname.endswith((".yaml", ".yml")):
             continue
         try:
             with open(os.path.join(rule_dir, fname)) as f:
                 import yaml
+                yaml_loaded = True
                 data = yaml.safe_load(f)
                 if data and "patterns" in data:
                     packs[fname] = data["patterns"]
+        except ImportError:
+            print("[sentinel] PyYAML not installed — skipping rule packs. Install: pip install PyYAML", file=sys.stderr)
+            return {}
         except Exception:
             pass
     return packs
@@ -288,7 +293,10 @@ def scan_cryptominers(dirs):
                         "detail": f"Cryptominer binary detected: {f}",
                         "severity": "critical",
                     })
-                if f.endswith(".dat") and any(n in root for n in ["template", "css", "js", "plugins"]):
+                if f.endswith(".dat") and any(
+                    os.sep + d == root or root.startswith(os.sep + d + os.sep) or root.startswith(d + os.sep)
+                    for d in ("template", "css", "js", "plugins")
+                ):
                     fp = os.path.join(root, f)
                     findings.append({
                         "type": "miner_config_in_webroot",
@@ -549,17 +557,40 @@ def _diff_detail(fp, old_hash=None):
     return f'{lines} lines, {sz} bytes'
 
 
-# ─── v0.4.0: Alert Dedup ────────────────────────────────────────
-
-_ALERT_DEDUP = {}
+# ─── v0.4.0: Alert Dedup (SQLite-persistent) ─────────────────────
 
 
-def _is_duplicate_alert(fp, window_minutes=10):
+def _alert_dedup_db():
+    """Ensure dedup table exists in baseline db."""
+    import contextlib
+    try:
+        db = sqlite3.connect(_get_baseline_db())
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS alert_dedup (
+                key TEXT PRIMARY KEY,
+                last_alert REAL NOT NULL
+            )
+        """)
+        db.commit()
+        db.close()
+    except Exception:
+        pass
+
+
+def _is_duplicate_alert(key, window_minutes=10):
     now = time.time()
-    if fp in _ALERT_DEDUP:
-        if now - _ALERT_DEDUP[fp] < window_minutes * 60:
+    _alert_dedup_db()
+    try:
+        db = sqlite3.connect(_get_baseline_db())
+        row = db.execute("SELECT last_alert FROM alert_dedup WHERE key = ?", (key,)).fetchone()
+        if row and now - row[0] < window_minutes * 60:
+            db.close()
             return True
-    _ALERT_DEDUP[fp] = now
+        db.execute("INSERT OR REPLACE INTO alert_dedup (key, last_alert) VALUES (?, ?)", (key, now))
+        db.commit()
+        db.close()
+    except Exception:
+        pass
     return False
 
 
@@ -811,33 +842,6 @@ def baseline_db_remove(filepath):
     db.close()
 
 
-def baseline_db_new_files(dirs):
-    """Return files that exist on disk but NOT in baseline."""
-    new_files = []
-    db_path = _get_baseline_db()
-    known = set()
-    if os.path.exists(db_path):
-        try:
-            db = sqlite3.connect(db_path)
-            rows = db.execute("SELECT filepath FROM baseline").fetchall()
-            known = {r[0] for r in rows}
-            db.close()
-        except Exception:
-            pass
-
-    for d in dirs:
-        if not os.path.isdir(d):
-            continue
-        for root, _, files in os.walk(d):
-            for f in files:
-                fp = os.path.join(root, f)
-                ext = os.path.splitext(f)[1].lower()
-                if ext in SCAN_EXTENSIONS and fp not in known:
-                    new_files.append(fp)
-    return new_files
-
-
-
 # ─── v0.8.0: Persistent Incident Logger ───────────────────────────
 
 def _generate_scan_id():
@@ -924,6 +928,10 @@ def quarantine_file(filepath, finding, config):
     qdir = os.path.join(qbase, ts)
     os.makedirs(qdir, exist_ok=True)
 
+    if os.path.isdir(filepath):
+        print(f"[quarantine] Skipping directory: {filepath}", file=sys.stderr)
+        return False, None
+
     try:
         # Use hash prefix for uniqueness
         h = hashlib.sha256(filepath.encode()).hexdigest()[:8]
@@ -990,6 +998,40 @@ def should_quarantine(finding, config):
     if not finding.get("file"):
         return False
     return True
+
+
+def _scan_file_patterns(fp, content, findings):
+    """Run built-in malware patterns against file content. Mutates findings list."""
+    for domain in JUDOL_DOMAINS:
+        if domain.lower() in content.lower():
+            findings.append({
+                "type": "suspicious_domain",
+                "file": fp,
+                "detail": f"Reference to gambling-related domain: {domain}",
+                "severity": "high",
+            })
+            break
+
+    for pattern, desc in PHP_BACKDOOR_PATTERNS:
+        if re.search(pattern, content, re.IGNORECASE):
+            findings.append({
+                "type": "php_backdoor",
+                "file": fp,
+                "detail": desc,
+                "pattern": pattern,
+                "severity": "critical",
+            })
+            break
+
+    if os.path.basename(fp) == ".htaccess":
+        redirects = re.findall(r"RewriteRule\s+.*https?://([^\s\]]+)", content, re.IGNORECASE)
+        for target in redirects:
+            findings.append({
+                "type": "htaccess_redirect",
+                "file": fp,
+                "detail": f".htaccess redirect to external domain: {target}",
+                "severity": "high",
+            })
 
 
 def build_baseline(dirs):
@@ -1077,39 +1119,8 @@ def scan_files(dirs, baseline=None, config=None, git_changed=None):
                 except (OSError, PermissionError):
                     continue
 
-                # Scan for domain-level attacks
-                for domain in JUDOL_DOMAINS:
-                    if domain.lower() in content.lower():
-                        findings.append({
-                            "type": "suspicious_domain",
-                            "file": fp,
-                            "detail": f"Reference to gambling-related domain: {domain}",
-                            "severity": "high",
-                        })
-                        break
-
-                # Scan for PHP backdoors
-                for pattern, desc in PHP_BACKDOOR_PATTERNS:
-                    if re.search(pattern, content, re.IGNORECASE):
-                        findings.append({
-                            "type": "php_backdoor",
-                            "file": fp,
-                            "detail": desc,
-                            "pattern": pattern,
-                            "severity": "critical",
-                        })
-                        break
-
-                # Scan .htaccess for suspicious redirects
-                if f == ".htaccess":
-                    redirects = re.findall(r"RewriteRule\s+.*https?://([^\s\]]+)", content, re.IGNORECASE)
-                    for target in redirects:
-                        findings.append({
-                            "type": "htaccess_redirect",
-                            "file": fp,
-                            "detail": f".htaccess redirect to external domain: {target}",
-                            "severity": "high",
-                        })
+                # Scan built-in malware patterns
+                _scan_file_patterns(fp, content, findings)
 
     return findings, scanned_paths
 
@@ -1817,37 +1828,8 @@ def scan_files_incremental(file_list, baseline=None, config=None, git_changed=No
         except (OSError, PermissionError):
             continue
 
-        # Run malware patterns
-        for domain in JUDOL_DOMAINS:
-            if domain.lower() in content.lower():
-                findings.append({
-                    "type": "suspicious_domain",
-                    "file": fp,
-                    "detail": f"Reference to gambling-related domain: {domain}",
-                    "severity": "high",
-                })
-                break
-
-        for pattern, desc in PHP_BACKDOOR_PATTERNS:
-            if re.search(pattern, content, re.IGNORECASE):
-                findings.append({
-                    "type": "php_backdoor",
-                    "file": fp,
-                    "detail": desc,
-                    "pattern": pattern,
-                    "severity": "critical",
-                })
-                break
-
-        if os.path.basename(fp) == ".htaccess":
-            redirects = re.findall(r"RewriteRule\s+.*https?://([^\s\]]+)", content, re.IGNORECASE)
-            for target in redirects:
-                findings.append({
-                    "type": "htaccess_redirect",
-                    "file": fp,
-                    "detail": f".htaccess redirect to external domain: {target}",
-                    "severity": "high",
-                })
+        # Run built-in malware patterns
+        _scan_file_patterns(fp, content, findings)
 
     return findings, scanned_paths
 
