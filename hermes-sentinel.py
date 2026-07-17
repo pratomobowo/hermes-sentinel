@@ -485,6 +485,46 @@ SCAN_EXTENSIONS = {".php", ".html", ".htm", ".js", ".htaccess", ".phtml", ".php5
 # File types that should NEVER exist in uploads (always flag)
 DANGEROUS_IN_UPLOADS = {".php", ".phtml", ".php5", ".php7", ".pht", ".sh", ".exe", ".py", ".pl"}
 
+# Path patterns to skip for integrity monitoring (volatile files)
+# Content scanning still runs — only new_file/file_modified/file_deleted are suppressed
+DEFAULT_INTEGRITY_EXCLUDES = [
+    "cache/", "tmp/", "temp/", "logs/", "sessions/",
+    "compiled/", "templates_c/", "var/cache/", "storage/framework/",
+    ".git/", "node_modules/", "vendor/",
+]
+DEFAULT_INTEGRITY_EXCLUDE_GLOBS = [
+    "*.log", "*.cache", "*.lock", "*.pid", "*.tmp",
+]
+
+
+def is_volatile_path(filepath, config=None):
+    """Check if a file should be excluded from integrity monitoring.
+    Still scanned for malware content — only new_file/file_modified/file_deleted are suppressed."""
+    import fnmatch
+
+    fname = os.path.basename(filepath)
+
+    # Check config-provided excludes first
+    if config:
+        for pat in config.get("integrity_excludes", []):
+            if pat.startswith("*."):
+                if fnmatch.fnmatch(fname, pat):
+                    return True
+            elif pat in filepath:
+                return True
+
+    # Check built-in defaults
+    for pat in DEFAULT_INTEGRITY_EXCLUDES:
+        # Match as directory component (not substring)
+        # e.g. "cache/" matches /var/www/cache/ but not /tmp/sentinel-cache/
+        if f"/{pat}" in filepath or filepath.startswith(f"/{pat}"):
+            return True
+    for gpat in DEFAULT_INTEGRITY_EXCLUDE_GLOBS:
+        if fnmatch.fnmatch(fname, gpat):
+            return True
+
+    return False
+
 
 def hash_file(path):
     """Return SHA256 of a file."""
@@ -734,8 +774,9 @@ def build_baseline(dirs):
     return baseline
 
 
-def scan_files(dirs, baseline=None):
-    """Scan watched directories for threats. Returns list of findings."""
+def scan_files(dirs, baseline=None, config=None):
+    """Scan watched directories for threats. Returns list of findings.
+    config is needed for integrity exclude checking."""
     findings = []
     scanned_paths = set()
 
@@ -766,7 +807,8 @@ def scan_files(dirs, baseline=None):
                 scanned_paths.add(fp)
 
                 # Check baseline: new file (exists on disk, not in baseline)
-                if baseline and fp not in baseline:
+                # Skip integrity check for volatile paths (cache, logs, sessions, etc.)
+                if baseline and fp not in baseline and not is_volatile_path(fp, config):
                     current_hash = hash_file(fp)
                     if current_hash:
                         findings.append({
@@ -780,15 +822,17 @@ def scan_files(dirs, baseline=None):
                         baseline[fp] = current_hash
 
                 # Check baseline: file modified
+                # Skip integrity alert for volatile paths, but silently re-baseline
                 if baseline and fp in baseline:
                     current_hash = hash_file(fp)
                     if current_hash and current_hash != baseline[fp]:
-                        findings.append({
-                            "type": "file_modified",
-                            "file": fp,
-                            "detail": "File hash changed from baseline",
-                            "severity": "medium",
-                        })
+                        if not is_volatile_path(fp, config):
+                            findings.append({
+                                "type": "file_modified",
+                                "file": fp,
+                                "detail": "File hash changed from baseline",
+                                "severity": "medium",
+                            })
                         # Re-baseline so same change doesn't alert again
                         baseline_db_update(fp, current_hash)
                         baseline[fp] = current_hash
@@ -838,8 +882,9 @@ def scan_files(dirs, baseline=None):
 
 # ─── Scan: detect files deleted from baseline ────────────────────
 
-def scan_deleted_files(scanned_paths):
-    """Detect files in baseline that no longer exist on disk."""
+def scan_deleted_files(scanned_paths, config=None):
+    """Detect files in baseline that no longer exist on disk.
+    Skips volatile paths to avoid noise."""
     findings = []
     db_path = _get_baseline_db()
     if not os.path.exists(db_path):
@@ -850,12 +895,13 @@ def scan_deleted_files(scanned_paths):
         db.close()
         for (fp,) in rows:
             if fp not in scanned_paths and not os.path.exists(fp):
-                findings.append({
-                    "type": "file_deleted",
-                    "file": fp,
-                    "detail": "Baseline file no longer exists on disk",
-                    "severity": "low",
-                })
+                if not is_volatile_path(fp, config):
+                    findings.append({
+                        "type": "file_deleted",
+                        "file": fp,
+                        "detail": "Baseline file no longer exists on disk",
+                        "severity": "low",
+                    })
                 baseline_db_remove(fp)
     except Exception:
         pass
@@ -998,7 +1044,7 @@ def main():
 
     # Single scan mode (for cron usage)
     if args.scan_once or args.json:
-        findings, scanned_paths = scan_files(watch_dirs, baseline)
+        findings, scanned_paths = scan_files(watch_dirs, baseline, config)
         findings.extend(scan_crontabs())
         findings.extend(scan_recent_files(watch_dirs, minutes=60))
         findings.extend(scan_cryptominers(watch_dirs))
@@ -1008,7 +1054,7 @@ def main():
         findings.extend(scan_cloned_malware(watch_dirs))
         if rule_packs:
             findings.extend(scan_rule_packs(watch_dirs, rule_packs))
-        findings.extend(scan_deleted_files(scanned_paths))
+        findings.extend(scan_deleted_files(scanned_paths, config))
 
         # Quarantine CRITICAL/HIGH findings
         quarantine_count = 0
@@ -1038,7 +1084,7 @@ def main():
     while True:
         try:
             print(f"[sentinel] Scanning... ({time.strftime('%H:%M:%S')})")
-            findings, scanned_paths = scan_files(watch_dirs, baseline)
+            findings, scanned_paths = scan_files(watch_dirs, baseline, config)
             findings.extend(scan_crontabs())
             findings.extend(scan_recent_files(watch_dirs, minutes=interval // 60))
             findings.extend(scan_cryptominers(watch_dirs))
@@ -1048,7 +1094,7 @@ def main():
             findings.extend(scan_cloned_malware(watch_dirs))
             if rule_packs:
                 findings.extend(scan_rule_packs(watch_dirs, rule_packs))
-            findings.extend(scan_deleted_files(scanned_paths))
+            findings.extend(scan_deleted_files(scanned_paths, config))
 
             if findings:
                 # Quarantine CRITICAL/HIGH before reporting
