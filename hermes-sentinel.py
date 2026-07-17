@@ -714,6 +714,32 @@ def baseline_db_init():
             value TEXT
         )
     """)
+    # v0.8.0: Persistent incident log for SOC reporting
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS incidents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_id TEXT NOT NULL,
+            server_name TEXT NOT NULL DEFAULT 'unknown',
+            timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+            severity TEXT NOT NULL,
+            type TEXT NOT NULL,
+            file TEXT,
+            detail TEXT,
+            rule_pack TEXT,
+            sha256 TEXT,
+            quarantined INTEGER DEFAULT 0,
+            scan_mode TEXT DEFAULT 'daemon'
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_incidents_scan ON incidents(scan_id)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_incidents_timestamp ON incidents(timestamp)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_incidents_severity ON incidents(severity)
+    """)
     db.commit()
     db.close()
 
@@ -811,7 +837,74 @@ def baseline_db_new_files(dirs):
     return new_files
 
 
+
+# ─── v0.8.0: Persistent Incident Logger ───────────────────────────
+
+def _generate_scan_id():
+    """Generate unique scan ID: SCAN-YYYYMMDD-HHMMSS-XXXX."""
+    import random, string
+    suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"SCAN-{time.strftime('%Y%m%d-%H%M%S')}-{suffix}"
+
+
+def log_incidents(findings, scan_id, config, scan_mode='daemon'):
+    """Persist all findings from a scan to the incidents table for SOC reporting."""
+    server_name = config.get('server_name', os.uname().nodename)
+    try:
+        db = sqlite3.connect(_get_baseline_db())
+        for f in findings:
+            db.execute("""
+                INSERT INTO incidents (scan_id, server_name, timestamp, severity, type, file, detail, rule_pack, sha256, quarantined, scan_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                scan_id,
+                server_name,
+                f.get('timestamp', time.strftime('%Y-%m-%dT%H:%M:%S')),
+                f.get('severity', 'low'),
+                f.get('type', 'unknown'),
+                f.get('file', ''),
+                f.get('detail', ''),
+                f.get('rule_pack', ''),
+                f.get('sha256', ''),
+                1 if f.get('quarantined') else 0,
+                scan_mode,
+            ))
+        db.commit()
+        db.close()
+        return len(findings)
+    except Exception as e:
+        print(f"[sentinel] Failed to log incidents: {e}")
+        return 0
+
+
+def query_incidents(start=None, end=None, severity=None, limit=1000):
+    """Query incident log for SOC reporting. Returns list of dicts."""
+    try:
+        db = sqlite3.connect(_get_baseline_db())
+        query = "SELECT * FROM incidents WHERE 1=1"
+        params = []
+        if start:
+            query += " AND timestamp >= ?"
+            params.append(start)
+        if end:
+            query += " AND timestamp <= ?"
+            params.append(end)
+        if severity:
+            query += " AND severity = ?"
+            params.append(severity)
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        rows = db.execute(query, params).fetchall()
+        cols = [desc[0] for desc in db.description]
+        db.close()
+        return [dict(zip(cols, row)) for row in rows]
+    except Exception as e:
+        print(f"[sentinel] Failed to query incidents: {e}")
+        return []
+
+
 # ─── Quarantine System ───────────────────────────────────────────
+
 
 def _quarantine_dir():
     """Return quarantine base directory (next to baseline db)."""
@@ -1903,6 +1996,12 @@ def daemon_loop_inotify(watch_dirs, baseline, config, rule_packs, interval):
                 if qcount:
                     print(f"[sentinel] Quarantined {qcount} files")
 
+                # v0.8.0: Log all findings to persistent incident DB for SOC reporting
+                scan_id = _generate_scan_id()
+                logged = log_incidents(findings, scan_id, config, scan_mode='inotify')
+                if logged:
+                    print(f"[sentinel] Logged {logged} incidents ({scan_id})")
+
                 print(f"[sentinel] {len(findings)} findings detected")
                 for f in findings:
                     if f.get("severity") in ("critical", "high"):
@@ -1999,6 +2098,12 @@ def main():
                     quarantine_count += 1
         if quarantine_count:
             print(f"[sentinel] Quarantined {quarantine_count} files")
+
+        # v0.8.0: Log all findings to persistent incident DB
+        scan_id = _generate_scan_id()
+        logged = log_incidents(findings, scan_id, config, scan_mode='scan-once')
+        if logged:
+            print(f"[sentinel] Logged {logged} incidents ({scan_id})")
 
         if args.json:
             print(json.dumps(findings, indent=2, ensure_ascii=False))
