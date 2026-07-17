@@ -26,6 +26,7 @@ import re
 import sys
 import time
 import sqlite3
+import shutil
 import urllib.request
 import argparse
 from pathlib import Path
@@ -628,6 +629,94 @@ def baseline_db_new_files(dirs):
     return new_files
 
 
+# ─── Quarantine System ───────────────────────────────────────────
+
+def _quarantine_dir():
+    """Return quarantine base directory (next to baseline db)."""
+    return os.path.join(os.path.dirname(_get_baseline_db()), "quarantine")
+
+
+def quarantine_file(filepath, finding, config):
+    """Move a file to quarantine with metadata. Returns (success, qpath)."""
+
+    # Guard: file might already be quarantined by a previous detection
+    if not os.path.exists(filepath):
+        return False, None
+
+    qbase = _quarantine_dir()
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    filename = os.path.basename(filepath)
+    qdir = os.path.join(qbase, ts)
+    os.makedirs(qdir, exist_ok=True)
+
+    try:
+        # Use hash prefix for uniqueness
+        h = hashlib.sha256(filepath.encode()).hexdigest()[:8]
+        qname = f"{h}_{filename}"
+        qpath = os.path.join(qdir, qname)
+
+        shutil.move(filepath, qpath)
+
+        meta = {
+            "original_path": filepath,
+            "quarantine_path": qpath,
+            "severity": finding.get("severity", "unknown"),
+            "finding_type": finding.get("type", "unknown"),
+            "detail": finding.get("detail", ""),
+            "quarantined_at": ts,
+            "server": config.get("server_name", os.uname().nodename),
+        }
+        with open(qpath + ".meta.json", "w") as f:
+            json.dump(meta, f, indent=2)
+
+        _quarantine_log(meta)
+        return True, qpath
+    except Exception as e:
+        print(f"[quarantine] Failed to quarantine {filepath}: {e}", file=sys.stderr)
+        return False, None
+
+
+def _quarantine_log(meta):
+    """Append quarantine event to SQLite log."""
+    db_path = _get_baseline_db()
+    try:
+        db = sqlite3.connect(db_path)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS quarantine_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filepath TEXT,
+                quarantine_path TEXT,
+                severity TEXT,
+                finding_type TEXT,
+                detail TEXT,
+                quarantined_at TEXT DEFAULT (datetime('now')),
+                restored INTEGER DEFAULT 0
+            )
+        """)
+        db.execute(
+            """INSERT INTO quarantine_log (filepath, quarantine_path, severity, finding_type, detail)
+               VALUES (?, ?, ?, ?, ?)""",
+            (meta["original_path"], meta["quarantine_path"],
+             meta["severity"], meta["finding_type"], meta["detail"])
+        )
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"[quarantine] Failed to log: {e}", file=sys.stderr)
+
+
+def should_quarantine(finding, config):
+    """Decide if a finding triggers quarantine.
+    Quarantines CRITICAL + HIGH severity findings with file paths."""
+    if not config.get("quarantine", False):
+        return False
+    if finding.get("severity", "").lower() not in ("critical", "high"):
+        return False
+    if not finding.get("file"):
+        return False
+    return True
+
+
 def build_baseline(dirs):
     """Build initial hash baseline for all scannable files. Persists to SQLite."""
     baseline = {}
@@ -921,6 +1010,17 @@ def main():
             findings.extend(scan_rule_packs(watch_dirs, rule_packs))
         findings.extend(scan_deleted_files(scanned_paths))
 
+        # Quarantine CRITICAL/HIGH findings
+        quarantine_count = 0
+        for f in findings:
+            if should_quarantine(f, config):
+                ok, qpath = quarantine_file(f["file"], f, config)
+                if ok:
+                    f["quarantined"] = qpath
+                    quarantine_count += 1
+        if quarantine_count:
+            print(f"[sentinel] Quarantined {quarantine_count} files")
+
         if args.json:
             print(json.dumps(findings, indent=2, ensure_ascii=False))
         elif findings:
@@ -951,6 +1051,17 @@ def main():
             findings.extend(scan_deleted_files(scanned_paths))
 
             if findings:
+                # Quarantine CRITICAL/HIGH before reporting
+                qcount = 0
+                for f in findings:
+                    if should_quarantine(f, config):
+                        ok, qpath = quarantine_file(f["file"], f, config)
+                        if ok:
+                            f["quarantined"] = qpath
+                            qcount += 1
+                if qcount:
+                    print(f"[sentinel] Quarantined {qcount} files")
+
                 print(f"[sentinel] {len(findings)} findings detected")
                 for f in findings:
                     if f.get("severity") in ("critical", "high"):
