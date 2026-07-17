@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermes Sentinel v0.4.0 — Lightweight web server malware detection agent.
+"""Hermes Sentinel v0.5.0 — Lightweight web server malware detection agent.
 
 Watches your web server for malware, gambling redirects, and backdoors.
 Reports findings to a central Hermes Agent for AI-powered reasoning.
@@ -1104,6 +1104,393 @@ def scan_recent_files(dirs, minutes=60):
 
     return findings
 
+# ─── v0.5.0: Behavioral Process Scanner ──────────────────────────
+
+# Suspicious process patterns
+PROCESS_SIGNATURES = [
+    # Reverse shells
+    (r"/dev/tcp/", "Reverse shell: /dev/tcp/ connection attempt"),
+    (r"bash -i >&", "Reverse shell: interactive bash redirect"),
+    (r"nc -e.*(/bin/\w+|/bin/bash|/bin/sh)", "Reverse shell: netcat -e backdoor"),
+    (r"bash -c.*\$\(.*\)", "Process command injection via bash -c"),
+    # Python execution wrappers
+    (r"python\d* -c.*(eval|exec|pty\.spawn|os\.system|subprocess)", "Python execution wrapper"),
+    (r"python\d* -c.*base64", "Python base64 execution chain"),
+    # Suspicious command patterns
+    (r"chmod\s+[0-7]*7[0-7]*7\s+/", "Suspicious chmod: world-writable binary"),
+    (r"iptables.*DROP.*OUTPUT", "Suspicious iptables: blocking outbound traffic"),
+    # Data exfiltration
+    (r"tar.*\|.*(nc|curl|wget)", "Data exfiltration: tar piped to network"),
+    (r"curl.*-F.*@/", "Data upload via curl -F"),
+]
+
+def scan_processes():
+    """Scan running processes for reverse shells, suspicious execution, and anomalies.
+    Reads /proc/*/cmdline — no 'ps' dependency."""
+    findings = []
+
+    # Helper: read cmdline from pid
+    def read_cmdline(pid):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read()
+            return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = entry
+            cmdline = read_cmdline(pid)
+            if not cmdline:
+                continue
+
+            # Check process signatures
+            for pat, desc in PROCESS_SIGNATURES:
+                if re.search(pat, cmdline, re.IGNORECASE):
+                    findings.append({
+                        "type": "suspicious_process",
+                        "detail": desc,
+                        "pid": int(pid),
+                        "cmdline": cmdline[:256],
+                        "severity": "critical",
+                    })
+                    break
+
+            # Suspicious parent-child: web server spawning shell
+            if cmdline.startswith(("sh", "bash", "/bin/sh", "/bin/bash")):
+                try:
+                    ppid_stat = f"/proc/{pid}/stat"
+                    with open(ppid_stat) as f:
+                        stat = f.read()
+                    ppid = stat.split()[3]
+                    parent_cmd = read_cmdline(ppid)
+                    if parent_cmd and any(s in parent_cmd.lower() for s in
+                        ("nginx", "apache", "httpd", "php", "www-data", "postgres")):
+                        findings.append({
+                            "type": "suspicious_parent_process",
+                            "detail": f"Shell spawned by web/service process ({parent_cmd[:80]})",
+                            "pid": int(pid),
+                            "ppid": int(ppid),
+                            "cmdline": cmdline[:128],
+                            "parent_cmdline": parent_cmd[:128],
+                            "severity": "critical",
+                        })
+                except Exception:
+                    pass
+
+    except PermissionError:
+        pass  # Can't read /proc — no findings
+
+    return findings
+
+
+# ─── v0.5.0: Network Connection Monitor ─────────────────────────
+
+# Suspicious outbound ports
+BOTNET_PORTS = {6667, 6697, 9999, 31337, 4444, 4445, 8080, 8081, 9001}
+
+# Suspicious IP patterns (RFC 1918 + localhost excluded from alert)
+def _parse_proc_net_tcp():
+    """Parse /proc/net/tcp into list of (local_ip, local_port, remote_ip, remote_port, state)."""
+    entries = []
+    try:
+        with open("/proc/net/tcp") as f:
+            lines = f.readlines()[1:]  # Skip header
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) < 10:
+                continue
+            # local_address (hex), rem_address (hex), st (state)
+            local_hex = parts[1]
+            remote_hex = parts[2]
+            st = parts[3]
+
+            # Parse hex address:port (reverse byte order)
+            lip_int = int(local_hex.split(":")[0], 16)
+            lport_int = int(local_hex.split(":")[1], 16)
+            rip_int = int(remote_hex.split(":")[0], 16)
+            rport_int = int(remote_hex.split(":")[1], 16)
+
+            local_ip = f"{(lip_int >> 24) & 0xff}.{(lip_int >> 16) & 0xff}.{(lip_int >> 8) & 0xff}.{lip_int & 0xff}"
+            remote_ip = f"{(rip_int >> 24) & 0xff}.{(rip_int >> 16) & 0xff}.{(rip_int >> 8) & 0xff}.{rip_int & 0xff}"
+
+            entries.append((local_ip, lport_int, remote_ip, rport_int, st))
+        return entries
+    except Exception:
+        return []
+
+
+def scan_network_connections():
+    """Detect suspicious network connections: botnet ports, foreign IPs, listener changes."""
+    findings = []
+    entries = _parse_proc_net_tcp()
+
+    # Track listening ports (baseline for comparison)
+    current_listeners = set()
+    for lip, lp, rip, rp, st in entries:
+        # TCP_LISTEN = 0A, TCP_ESTABLISHED = 01
+        if st == "0A":
+            current_listeners.add(lp)
+
+    # Check for suspicious outbound connections
+    for lip, lp, rip, rp, st in entries:
+        if st != "01":  # Only established connections
+            continue
+
+        # Botnet/IRC ports
+        if rp in BOTNET_PORTS:
+            findings.append({
+                "type": "suspicious_network_connection",
+                "detail": f"Outbound connection to botnet/IRC port {rp} -> {rip}",
+                "local_ip": lip,
+                "local_port": lp,
+                "remote_ip": rip,
+                "remote_port": rp,
+                "severity": "high",
+            })
+
+        # High outbound ports (potential reverse shell callbacks)
+        if rp > 50000 and rp not in (80, 443, 8080, 8443):
+            findings.append({
+                "type": "high_port_outbound",
+                "detail": f"Outbound connection to high port {rp} -> {rip}",
+                "local_ip": lip,
+                "local_port": lp,
+                "remote_ip": rip,
+                "remote_port": rp,
+                "severity": "medium",
+            })
+
+    # Check for new listening ports (vs baseline)
+    stored_listeners = _get_state("network_listeners")
+    if stored_listeners:
+        try:
+            prev = set(json.loads(stored_listeners))
+            new_ports = current_listeners - prev
+            closed_ports = prev - current_listeners
+
+            for port in new_ports:
+                findings.append({
+                    "type": "new_listening_port",
+                    "detail": f"New port listening: {port} — potential backdoor or unauthorized service",
+                    "port": port,
+                    "severity": "high",
+                })
+            for port in closed_ports:
+                findings.append({
+                    "type": "closed_listening_port",
+                    "detail": f"Port stopped listening: {port} — service may have been stopped",
+                    "port": port,
+                    "severity": "low",
+                })
+        except json.JSONDecodeError:
+            pass
+
+    # Save current listener snapshot
+    _set_state("network_listeners", json.dumps(sorted(current_listeners)))
+
+    return findings
+
+
+# ─── v0.5.0: User Session Monitor ────────────────────────────────
+
+def scan_user_sessions():
+    """Detect suspicious SSH logins, new users, and anomalous session times."""
+    findings = []
+
+    # Track known users via sentinel_state
+    known_users_raw = _get_state("known_users")
+    known_users = set(json.loads(known_users_raw)) if known_users_raw else set()
+
+    current_users = set()
+    try:
+        # Check /etc/passwd for new users (UID >= 1000 = human user)
+        with open("/etc/passwd") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) < 4:
+                    continue
+                uid = int(parts[2])
+                username = parts[0]
+                if uid >= 1000 and uid < 65534:
+                    current_users.add(username)
+                    if known_users and username not in known_users:
+                        findings.append({
+                            "type": "new_system_user",
+                            "detail": f"New user account created: {username} (UID {uid})",
+                            "username": username,
+                            "uid": uid,
+                            "severity": "high",
+                        })
+    except Exception:
+        pass
+
+    _set_state("known_users", json.dumps(sorted(current_users)))
+
+    # Check active sessions via 'who' command
+    try:
+        result = subprocess.run(["who", "-u"], capture_output=True, text=True, timeout=5)
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            username = parts[0]
+            tty = parts[1]
+
+            # Root SSH login (not from console)
+            if username == "root" and tty != "tty1" and tty != "console":
+                findings.append({
+                    "type": "root_remote_login",
+                    "detail": f"Root login via {tty} — use sudo instead",
+                    "username": username,
+                    "session_line": line.strip(),
+                    "severity": "high",
+                })
+
+            # Login at odd hours (midnight - 5am)
+            try:
+                login_time = parts[2] if len(parts) > 2 else ""
+                if login_time and ":" in login_time:
+                    parts_time = login_time.split(":")
+                    if len(parts_time) >= 2:
+                        hour = int(parts_time[0].split()[-1] if " " in parts_time[0] else parts_time[0])
+                        if 0 <= hour <= 5:
+                            findings.append({
+                                "type": "odd_hour_login",
+                                "detail": f"User {username} logged in at odd hour ({login_time}) via {tty}",
+                                "username": username,
+                                "session_line": line.strip(),
+                                "severity": "medium",
+                            })
+            except (ValueError, IndexError):
+                pass
+    except Exception:
+        pass
+
+    # Check 'last' for recent login failures (brute force)
+    try:
+        result = subprocess.run(["lastb", "-n", "20"], capture_output=True, text=True, timeout=5)
+        fail_count = sum(1 for l in result.stdout.splitlines() if l.strip() and "ssh:" in l.lower())
+        if fail_count >= 10:
+            findings.append({
+                "type": "ssh_brute_force",
+                "detail": f"{fail_count} recent SSH login failures — possible brute force attack",
+                "fail_count": fail_count,
+                "severity": "high",
+            })
+    except Exception:
+        pass
+
+    return findings
+
+
+# ─── v0.5.0: Systemd Timer & Extended Cron Monitor ───────────────
+
+def scan_systemd_timers():
+    """Detect new or suspicious systemd timers."""
+    findings = []
+
+    known_timers_raw = _get_state("known_timers")
+    known_timers = set(json.loads(known_timers_raw)) if known_timers_raw else set()
+
+    current_timers = set()
+    timer_paths = ["/etc/systemd/system/", "/lib/systemd/system/"]
+
+    for tpath in timer_paths:
+        try:
+            for fname in os.listdir(tpath):
+                if fname.endswith(".timer"):
+                    current_timers.add(f"{tpath}{fname}")
+        except Exception:
+            pass
+
+    if known_timers:
+        new_timers = current_timers - known_timers
+        for t in new_timers:
+            # Read timer file for details
+            timer_detail = ""
+            try:
+                with open(t) as f:
+                    timer_detail = f.read()[:256]
+            except Exception:
+                pass
+            findings.append({
+                "type": "new_systemd_timer",
+                "detail": f"New systemd timer: {os.path.basename(t)}",
+                "timer_path": t,
+                "timer_content": timer_detail[:256],
+                "severity": "medium",
+            })
+
+    _set_state("known_timers", json.dumps(sorted(current_timers)))
+    return findings
+
+
+def scan_extended_crontabs():
+    """Extended cron scan: system-wide crontab, /etc/cron.*/, and suspicious patterns."""
+    findings = []
+
+    # Standard user crontab scan (existing)
+    findings.extend(scan_crontabs())
+
+    # System-wide crontab
+    try:
+        with open("/etc/crontab") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # Check for suspicious patterns
+                for pat, desc in SUSPICIOUS_CRON_PATTERNS:
+                    if re.search(pat, line, re.IGNORECASE):
+                        findings.append({
+                            "type": "suspicious_system_cron",
+                            "detail": f"System crontab: {desc}",
+                            "line": line,
+                            "severity": "high",
+                        })
+    except Exception:
+        pass
+
+    # /etc/cron.d/ entries
+    cron_d_dir = "/etc/cron.d/"
+    known_cron_d_raw = _get_state("known_cron_d")
+    known_cron_d = set(json.loads(known_cron_d_raw)) if known_cron_d_raw else set()
+
+    current_cron_d = set()
+    try:
+        for fname in os.listdir(cron_d_dir):
+            fp = os.path.join(cron_d_dir, fname)
+            if os.path.isfile(fp):
+                current_cron_d.add(fname)
+    except Exception:
+        pass
+
+    if known_cron_d:
+        new_cron = current_cron_d - known_cron_d
+        for name in new_cron:
+            cron_content = ""
+            try:
+                with open(os.path.join(cron_d_dir, name)) as f:
+                    cron_content = f.read()[:256]
+            except Exception:
+                pass
+            findings.append({
+                "type": "new_cron_entry",
+                "detail": f"New /etc/cron.d/ entry: {name}",
+                "cron_file": f"/etc/cron.d/{name}",
+                "content": cron_content,
+                "severity": "medium",
+            })
+
+    _set_state("known_cron_d", json.dumps(sorted(current_cron_d)))
+    return findings
+
+
+
 
 def report_findings(findings, config):
     """Send findings to Hermes Agent master."""
@@ -1197,6 +1584,13 @@ def main():
             findings.extend(scan_rule_packs(watch_dirs, rule_packs))
         findings.extend(scan_deleted_files(scanned_paths, config, git_changed))
 
+        # v0.5.0: Behavioral monitoring
+        findings.extend(scan_processes())
+        findings.extend(scan_network_connections())
+        findings.extend(scan_user_sessions())
+        findings.extend(scan_systemd_timers())
+        findings.extend(scan_extended_crontabs())
+
         # Quarantine CRITICAL/HIGH findings
         quarantine_count = 0
         for f in findings:
@@ -1241,6 +1635,13 @@ def main():
             if rule_packs:
                 findings.extend(scan_rule_packs(watch_dirs, rule_packs))
             findings.extend(scan_deleted_files(scanned_paths, config, git_changed))
+
+            # v0.5.0: Behavioral monitoring
+            findings.extend(scan_processes())
+            findings.extend(scan_network_connections())
+            findings.extend(scan_user_sessions())
+            findings.extend(scan_systemd_timers())
+            findings.extend(scan_extended_crontabs())
 
             if findings:
                 # Quarantine CRITICAL/HIGH before reporting
