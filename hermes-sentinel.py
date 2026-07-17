@@ -57,6 +57,7 @@ PHP_BACKDOOR_PATTERNS = [
 # ─── New: Rule Pack Loader ─────────────────────────────────────
 
 RULE_PACKS = {}
+_dirty_hashes = {}
 def _load_rule_packs(rule_dir=None):
     """Load YAML rule packs from rules/ directory."""
     if rule_dir is None:
@@ -87,8 +88,9 @@ def _load_rule_packs(rule_dir=None):
 
 # ─── Scan with loaded rule packs ─────────────────────────────────
 
-def scan_rule_packs(dirs, rule_packs):
-    """Scan watch dirs using YAML rule pack patterns."""
+def scan_rule_packs(dirs, rule_packs, baseline=None, config=None):
+    """Scan watch dirs using YAML rule pack patterns.
+    baseline+config: enable integrity-based content skip for vendor/node_modules."""
     findings = []
 
     # Keys that indicate a pattern is meant for file-level scanning
@@ -262,6 +264,8 @@ def scan_rule_packs(dirs, rule_packs):
                                     continue
 
                         # --- All checks passed ---
+                        if baseline is not None and _should_skip_content_scan(fp, baseline, config):
+                            continue
                         findings.append({
                             "type": name,
                             "file": fp,
@@ -1163,18 +1167,12 @@ DEFAULT_CONTENT_SKIP_DIRS = ["vendor", "node_modules"]
 
 
 def _should_skip_content_scan(fp, baseline, config=None):
-    """Skip content scan for package dir files whose hash is unchanged
-    from baseline. Configurable via config.yaml 'content_skip_dirs'.
+    """Skip content scan for vendor/node_modules files whose hash is unchanged
+    from previous-run persistent baseline (SQLite). Direct DB lookup —
+    immune to fresh baseline rebuilds.
 
-    File must be:
-    1. Inside a content_skip_dirs directory (default: vendor, node_modules)
-    2. Present in the baseline hash database
-    3. Current hash matches baseline hash
-
-    Files with changed hash or new files still get full content scan.
+    Files with changed hash or not-yet-baselined always get full scan.
     """
-    if not baseline or fp not in baseline:
-        return False
     dirs = DEFAULT_CONTENT_SKIP_DIRS
     if config:
         dirs = config.get("content_skip_dirs", DEFAULT_CONTENT_SKIP_DIRS)
@@ -1184,10 +1182,20 @@ def _should_skip_content_scan(fp, baseline, config=None):
     if not any(m in fp for m in markers):
         return False
     current = hash_file(fp)
-    if current and current == baseline[fp]:
-        return True
+    if not current:
+        return False
+    db_path = _get_baseline_db()
+    if not os.path.exists(db_path):
+        return False
+    try:
+        db = sqlite3.connect(db_path)
+        row = db.execute("SELECT sha256 FROM baseline WHERE filepath = ?", (fp,)).fetchone()
+        db.close()
+        if row and row[0] == current:
+            return True
+    except Exception:
+        pass
     return False
-
 
 def _scan_file_patterns(fp, content, findings):
     """Run built-in malware patterns against file content. Mutates findings list."""
@@ -1244,6 +1252,8 @@ def scan_files(dirs, baseline=None, config=None, git_changed=None):
     """Scan watched directories for threats. Returns list of findings.
     config is needed for integrity exclude checking.
     git_changed is set of files changed by git (skip integrity alerts)."""
+    global _dirty_hashes
+    _dirty_hashes = {}
     findings = []
     scanned_paths = set()
 
@@ -1284,8 +1294,8 @@ def scan_files(dirs, baseline=None, config=None, git_changed=None):
                                 "detail": f"New file — {_diff_detail(fp)}",
                                 "severity": integrity_severity(fp),
                             })
-                            baseline_db_update(fp, current_hash)
                             baseline[fp] = current_hash
+                            _dirty_hashes[fp] = current_hash  # deferred — write after content scan
 
                 # Check baseline: file modified
                 if baseline and fp in baseline:
@@ -1298,8 +1308,8 @@ def scan_files(dirs, baseline=None, config=None, git_changed=None):
                                 "detail": f"Hash changed — {_diff_detail(fp)}",
                                 "severity": integrity_severity(fp),
                             })
-                        baseline_db_update(fp, current_hash)
                         baseline[fp] = current_hash
+                        _dirty_hashes[fp] = current_hash  # deferred — write after content scan
 
                 # Read and scan file content
                 if _should_skip_content_scan(fp, baseline, config):
@@ -1314,6 +1324,12 @@ def scan_files(dirs, baseline=None, config=None, git_changed=None):
                 # Scan built-in malware patterns
                 _scan_file_patterns(fp, content, findings)
 
+    # Don't update baseline for files with threat findings —
+    # keep them flagged for next scan
+    threat_files = {f["file"] for f in findings if f.get("file") and f.get("severity") in ("critical", "high")}
+    for fp, h in _dirty_hashes.items():
+        if fp not in threat_files:
+            baseline_db_update(fp, h)
     return findings, scanned_paths
 
 # ─── Scan: detect files deleted from baseline ────────────────────
@@ -2161,7 +2177,7 @@ def daemon_loop_inotify(watch_dirs, baseline, config, rule_packs, interval):
                 findings.extend(scan_cgi_webshell_dirs(watch_dirs))
                 findings.extend(scan_cloned_malware(watch_dirs))
                 if rule_packs:
-                    findings.extend(scan_rule_packs(watch_dirs, rule_packs))
+                    findings.extend(scan_rule_packs(watch_dirs, rule_packs, baseline, config))
                 findings.extend(scan_deleted_files(scanned_paths, config, git_changed))
                 findings.extend(scan_recent_files(watch_dirs, minutes=15))
 
@@ -2262,7 +2278,7 @@ def main():
         findings.extend(scan_cgi_webshell_dirs(watch_dirs))
         findings.extend(scan_cloned_malware(watch_dirs))
         if rule_packs:
-            findings.extend(scan_rule_packs(watch_dirs, rule_packs))
+            findings.extend(scan_rule_packs(watch_dirs, rule_packs, baseline, config))
         findings.extend(scan_deleted_files(scanned_paths, config, git_changed))
 
         # v0.5.0: Behavioral monitoring
