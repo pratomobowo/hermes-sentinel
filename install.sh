@@ -61,6 +61,21 @@ fi
 
 SERVER_NAME=${SERVER_NAME:-$(hostname)}
 
+# Quarantine mode
+echo ""
+echo "   🔒 Quarantine Mode"
+echo "   Auto-isolate CRITICAL+HIGH threats to a safe directory."
+echo "   Files are moved, not deleted — you can restore anytime."
+echo ""
+read -p "   Enable quarantine? (y/N): " QUARANTINE_CHOICE
+QUARANTINE_ENABLED="false"
+if [ "$QUARANTINE_CHOICE" = "y" ] || [ "$QUARANTINE_CHOICE" = "Y" ]; then
+    QUARANTINE_ENABLED="true"
+    echo "   ✅ Quarantine enabled"
+else
+    echo "   ℹ️  Quarantine disabled (report only)"
+fi
+
 # Write config
 cat > /etc/hermes-sentinel/config.yaml << YAML
 server_name: "${SERVER_NAME}"
@@ -69,6 +84,7 @@ secret: "${SHARED_SECRET}"
 watch_dirs:
 ${WATCH_DIRS_LIST}interval: 300
 baseline_on_start: true
+quarantine: ${QUARANTINE_ENABLED}
 YAML
 
 echo "   ✅ Config saved: /etc/hermes-sentinel/config.yaml"

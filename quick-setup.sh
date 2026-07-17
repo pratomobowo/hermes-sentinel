@@ -27,7 +27,7 @@ setup_satellite() {
     M_URL="${MASTER_URL:-http://localhost:8644/webhooks/sentinel}"
     S_NAME="${SERVER_NAME:-$(hostname)}"
 
-    printf "server_name: \"%s\"\nmaster_url: \"%s\"\nsecret: \"%s\"\nwatch_dirs:\n  - /var/www\ninterval: 300\nbaseline_on_start: true\n" \
+    printf 'server_name: "%s"\nmaster_url: "%s"\nsecret: "%s"\nwatch_dirs:\n  - /var/www\ninterval: 300\nbaseline_on_start: true\nquarantine: false\n' \
         "$S_NAME" "$M_URL" "$S" > /etc/hermes-sentinel/config.yaml
 
     echo "   Secret: $S"
