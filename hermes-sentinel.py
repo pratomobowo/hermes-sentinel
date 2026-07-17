@@ -1159,21 +1159,29 @@ def should_quarantine(finding, config):
 
 # ─── Integrity-Based Vendor Content Skip ───────────────────────
 
-PACKAGE_DIR_MARKERS = [os.sep + n + os.sep for n in ("vendor", "node_modules")]
+DEFAULT_CONTENT_SKIP_DIRS = ["vendor", "node_modules"]
 
 
-def _should_skip_content_scan(fp, baseline):
-    """Skip content scan for vendor/node_modules files whose hash is
-    unchanged from baseline (legitimate library code). File must be:
-    1. Inside a vendor/ or node_modules/ directory
+def _should_skip_content_scan(fp, baseline, config=None):
+    """Skip content scan for package dir files whose hash is unchanged
+    from baseline. Configurable via config.yaml 'content_skip_dirs'.
+
+    File must be:
+    1. Inside a content_skip_dirs directory (default: vendor, node_modules)
     2. Present in the baseline hash database
     3. Current hash matches baseline hash
 
-    Files with changed hash or new vendor files still get full content scan.
+    Files with changed hash or new files still get full content scan.
     """
     if not baseline or fp not in baseline:
         return False
-    if not any(m in fp for m in PACKAGE_DIR_MARKERS):
+    dirs = DEFAULT_CONTENT_SKIP_DIRS
+    if config:
+        dirs = config.get("content_skip_dirs", DEFAULT_CONTENT_SKIP_DIRS)
+    if not dirs:
+        return False
+    markers = [f"{os.sep}{d}{os.sep}" for d in dirs]
+    if not any(m in fp for m in markers):
         return False
     current = hash_file(fp)
     if current and current == baseline[fp]:
@@ -1294,7 +1302,7 @@ def scan_files(dirs, baseline=None, config=None, git_changed=None):
                         baseline[fp] = current_hash
 
                 # Read and scan file content
-                if _should_skip_content_scan(fp, baseline):
+                if _should_skip_content_scan(fp, baseline, config):
                     continue
 
                 try:
@@ -1997,7 +2005,7 @@ def scan_files_incremental(file_list, baseline=None, config=None, git_changed=No
                 baseline[fp] = current_hash
 
         # Content scan
-        if _should_skip_content_scan(fp, baseline):
+        if _should_skip_content_scan(fp, baseline, config):
             continue
         try:
             if is_large:
@@ -2303,6 +2311,7 @@ def _load_config(path):
         "watch_dirs": ["/var/www"],
         "interval": 300,
         "baseline_on_start": True,
+        "content_skip_dirs": ["vendor", "node_modules"],
     }
 
     if not os.path.exists(path):
