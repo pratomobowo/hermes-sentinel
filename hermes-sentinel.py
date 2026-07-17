@@ -77,6 +77,194 @@ def _load_rule_packs(rule_dir=None):
             pass
     return packs
 
+
+# ─── Scan with loaded rule packs ─────────────────────────────────
+
+def scan_rule_packs(dirs, rule_packs):
+    """Scan watch dirs using YAML rule pack patterns."""
+    findings = []
+
+    # Keys that indicate a pattern is meant for file-level scanning
+    FILE_FILTER_KEYS = {
+        "search_terms", "regex", "combined_regex", "domains",
+        "must_also_contain", "file_pattern", "file_names", "file_name",
+        "naming_pattern", "path_pattern", "path_indicators", "path_context",
+        "size_kb_min", "size_kb_max", "size_mb_gt", "size_trigger_mb",
+        "triggers",
+    }
+
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for root, _, files in os.walk(d):
+            for f in files:
+                fp = os.path.join(root, f)
+                ext = os.path.splitext(f)[1].lower()
+
+                try:
+                    sz = os.path.getsize(fp)
+                except OSError:
+                    continue
+
+                for pack_name, patterns in rule_packs.items():
+                    for pattern in patterns:
+                        name = pattern.get("name", "unknown")
+                        severity = pattern.get("severity", "medium")
+                        desc = pattern.get("description", "")
+
+                        # Skip patterns not meant for file-content scanning
+                        # (server health checks, cron-only, URL-only patterns, etc.)
+                        pattern_keys = set(pattern.keys()) - {"name", "severity", "description"}
+                        if not (pattern_keys & FILE_FILTER_KEYS):
+                            continue
+
+                        # --- Pre-content filters ---
+
+                        # file_pattern (glob match on filename)
+                        fpm = pattern.get("file_pattern")
+                        if fpm:
+                            import fnmatch
+                            if not fnmatch.fnmatch(f, fpm):
+                                continue
+
+                        # file_names (exact match)
+                        fn_list = pattern.get("file_names", [])
+                        if fn_list and f not in fn_list:
+                            continue
+
+                        # file_name (single exact match)
+                        file_name = pattern.get("file_name")
+                        if file_name and f != file_name:
+                            continue
+
+                        # naming_pattern (regex on filename)
+                        np_list = pattern.get("naming_pattern", [])
+                        if np_list and not any(re.search(p, f) for p in np_list):
+                            continue
+
+                        # path_pattern (regex on directory path)
+                        pp_raw = pattern.get("path_pattern")
+                        if pp_raw and not re.search(pp_raw, root):
+                            continue
+
+                        # path_indicators (regex on full path)
+                        pi_list = pattern.get("path_indicators", [])
+                        if pi_list and not any(re.search(p, fp) for p in pi_list):
+                            continue
+
+                        # path_context (substring in root)
+                        pc = pattern.get("path_context")
+                        if pc and pc not in root:
+                            continue
+
+                        # --- Size triggers ---
+
+                        if pattern.get("size_kb_min") and sz < pattern["size_kb_min"] * 1024:
+                            continue
+                        if pattern.get("size_kb_max") and sz > pattern["size_kb_max"] * 1024:
+                            continue
+                        if pattern.get("size_mb_gt") and sz < pattern["size_mb_gt"] * 1024 * 1024:
+                            continue
+                        if pattern.get("size_trigger_mb") and sz < pattern["size_trigger_mb"] * 1024 * 1024:
+                            continue
+
+                        # --- Nested triggers (webshell.yaml style) ---
+
+                        triggers = pattern.get("triggers")
+                        if triggers and isinstance(triggers, dict):
+                            t_size = triggers.get("size_mb_gt")
+                            if t_size and sz < t_size * 1024 * 1024:
+                                continue
+                            t_ext = triggers.get("extension")
+                            if t_ext:
+                                t_ext_norm = t_ext if t_ext.startswith(".") else f".{t_ext}"
+                                if ext != t_ext_norm and ext != t_ext:
+                                    continue
+                            t_dirs = triggers.get("likely_in_dirs", [])
+                            if t_dirs and not any(d in root.split(os.sep) for d in t_dirs):
+                                continue
+
+                        # --- Content checks ---
+
+                        need_content = any([
+                            pattern.get("search_terms"),
+                            pattern.get("regex"),
+                            pattern.get("combined_regex"),
+                            pattern.get("domains"),
+                            pattern.get("must_also_contain"),
+                            triggers and isinstance(triggers, dict) and triggers.get("must_contain"),
+                        ])
+
+                        content = None
+                        if need_content:
+                            if ext not in SCAN_EXTENSIONS:
+                                continue
+                            try:
+                                with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                                    content = fh.read()
+                            except (OSError, PermissionError):
+                                continue
+
+                        # search_terms (ANY match)
+                        st = pattern.get("search_terms", [])
+                        if st:
+                            if content is None:
+                                continue
+                            if not any(t.lower() in content.lower() for t in st):
+                                continue
+
+                        # regex
+                        rx = pattern.get("regex")
+                        if rx:
+                            if content is None:
+                                continue
+                            if not re.search(rx, content, re.IGNORECASE | re.DOTALL):
+                                continue
+
+                        # combined_regex
+                        crx = pattern.get("combined_regex")
+                        if crx:
+                            if content is None:
+                                continue
+                            if not re.search(crx, content, re.IGNORECASE | re.DOTALL):
+                                continue
+
+                        # domains
+                        dms = pattern.get("domains", [])
+                        if dms:
+                            if content is None:
+                                continue
+                            if not any(d.lower() in content.lower() for d in dms):
+                                continue
+
+                        # must_also_contain (ALL must match)
+                        mac = pattern.get("must_also_contain", [])
+                        if mac:
+                            if content is None:
+                                continue
+                            if not all(t.lower() in content.lower() for t in mac):
+                                continue
+
+                        # trigger-level must_contain
+                        if triggers and isinstance(triggers, dict):
+                            tmc = triggers.get("must_contain", [])
+                            if tmc:
+                                if content is None:
+                                    continue
+                                if not all(t.lower() in content.lower() for t in tmc):
+                                    continue
+
+                        # --- All checks passed ---
+                        findings.append({
+                            "type": name,
+                            "file": fp,
+                            "detail": desc,
+                            "severity": severity,
+                            "rule_pack": pack_name,
+                        })
+
+    return findings
+
 # ─── New: Cryptominer Detection ────────────────────────────────
 
 MINER_FILENAMES = {"defunct", "gs-dbus", "xmrig", "MINER_defunct_xmrig"}
@@ -520,6 +708,10 @@ def main():
     interval = int(config.get("interval", 300))
     baseline = {}
 
+    # Load YAML rule packs
+    rule_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules")
+    rule_packs = _load_rule_packs(rule_dir)
+
     if config.get("baseline_on_start", True):
         print(f"[sentinel] Building baseline for {len(watch_dirs)} directories...")
         baseline = build_baseline(watch_dirs)
@@ -535,6 +727,8 @@ def main():
         findings.extend(scan_shell_extensions(watch_dirs))
         findings.extend(scan_cgi_webshell_dirs(watch_dirs))
         findings.extend(scan_cloned_malware(watch_dirs))
+        if rule_packs:
+            findings.extend(scan_rule_packs(watch_dirs, rule_packs))
 
         if args.json:
             print(json.dumps(findings, indent=2, ensure_ascii=False))
@@ -561,6 +755,8 @@ def main():
             findings.extend(scan_shell_extensions(watch_dirs))
             findings.extend(scan_cgi_webshell_dirs(watch_dirs))
             findings.extend(scan_cloned_malware(watch_dirs))
+            if rule_packs:
+                findings.extend(scan_rule_packs(watch_dirs, rule_packs))
 
             if findings:
                 print(f"[sentinel] {len(findings)} findings detected")
